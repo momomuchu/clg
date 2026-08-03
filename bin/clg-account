@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""clg-account — gestion des comptes ChatGPT Pro pour clg.
+
+Usage:
+  clg-account add <nom> [--browser]   ajoute un compte (login device-code par défaut)
+  clg-account status                  état auth + proxy de chaque compte
+  clg-account remove <nom> [--purge]  retire un compte du registre (--purge efface l'auth)
+
+Chaque compte = un dossier CCP_CONFIG_DIR dédié + un port de proxy dédié.
+Le login "device" affiche un code à saisir sur openai.com dans N'IMPORTE QUEL
+navigateur/profil connecté au bon compte — c'est ce qui permet d'authentifier
+le compte B sans toucher au compte A.
+"""
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+CFG_DIR = HOME / ".config" / "clg"
+REGISTRY = CFG_DIR / "accounts.json"
+PROXY_BIN = shutil.which("claude-code-proxy") or "/opt/homebrew/bin/claude-code-proxy"
+BASE_PORT = 18765
+DEFAULT_REGISTRY = {
+    "a": {"dir": str(HOME / ".config/claude-code-proxy"), "port": BASE_PORT, "brew": True},
+}
+
+
+def load_registry() -> dict:
+    reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+    for name, acc in DEFAULT_REGISTRY.items():
+        reg.setdefault(name, acc)
+    return reg
+
+
+def save_registry(reg: dict) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    REGISTRY.write_text(json.dumps(reg, indent=2, sort_keys=True) + "\n")
+
+
+def next_port(reg: dict) -> int:
+    return max(acc["port"] for acc in reg.values()) + 1
+
+
+def cmd_add(name: str, browser: bool) -> int:
+    if not name.replace("-", "").isalnum() or name in ("auto", "list", "status"):
+        sys.exit(f"clg-account: nom invalide '{name}' (alphanumérique, pas 'auto'/'list'/'status')")
+    reg = load_registry()
+    if name in reg and (pathlib.Path(reg[name]["dir"]) / "codex" / "auth.json").exists():
+        print(f"@{name} existe déjà et est authentifié. Pour re-loguer: clg-account remove {name} --purge puis add.")
+        return 1
+
+    acc = reg.get(name) or {"dir": str(HOME / f".config/claude-code-proxy-{name}"), "port": next_port(reg)}
+    cfg_dir = pathlib.Path(acc["dir"])
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    config_json = cfg_dir / "config.json"
+    if not config_json.exists():
+        config_json.write_text('{\n  "aliasProvider": "codex"\n}\n')
+
+    mode = "login" if browser else "device"
+    print(f"→ Login Codex du compte @{name} ({'navigateur' if browser else 'device code'})")
+    if not browser:
+        print("  Ouvre le lien/saisis le code dans un navigateur ou profil connecté au BON compte ChatGPT.")
+    rc = subprocess.run(
+        [PROXY_BIN, "codex", "auth", mode],
+        env=dict(os.environ, CCP_CONFIG_DIR=str(cfg_dir)),
+    ).returncode
+    if rc != 0:
+        sys.exit(f"clg-account: login échoué (rc={rc}). Rien n'a été enregistré pour @{name}.")
+
+    if not (cfg_dir / "codex" / "auth.json").exists():
+        sys.exit("clg-account: login terminé mais codex/auth.json absent — compte NON enregistré (risque de fallback sur le compte par défaut).")
+
+    reg[name] = acc
+    save_registry(reg)
+    out = subprocess.run(
+        [PROXY_BIN, "codex", "auth", "status"],
+        capture_output=True, text=True, env=dict(os.environ, CCP_CONFIG_DIR=str(cfg_dir)),
+    ).stdout.strip()
+    print(f"✓ Compte @{name} enregistré (port {acc['port']}).\n{out}")
+    print(f"Utilisation: clg @{name} …   ou   clg @auto …  (round-robin)")
+    return 0
+
+
+def cmd_status() -> int:
+    return subprocess.run([str(HOME / ".local/bin/clg"), "@list"]).returncode
+
+
+def cmd_remove(name: str, purge: bool) -> int:
+    reg = load_registry()
+    if name not in reg:
+        sys.exit(f"clg-account: compte inconnu '@{name}'")
+    if reg[name].get("brew"):
+        sys.exit("clg-account: le compte par défaut @a (service brew) ne se retire pas d'ici.")
+    acc = reg.pop(name)
+    save_registry(reg)
+    if purge:
+        shutil.rmtree(acc["dir"], ignore_errors=True)
+    print(f"✓ @{name} retiré" + (" (auth effacée)" if purge else f" (auth conservée dans {acc['dir']})"))
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd == "add" and rest:
+        return cmd_add(rest[0], "--browser" in rest)
+    if cmd in ("status", "list"):
+        return cmd_status()
+    if cmd == "remove" and rest:
+        return cmd_remove(rest[0], "--purge" in rest)
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""clg — Claude Code hybride : chat principal sur Opus Anthropic réel,
+sub-agents sur GPT via claude-code-proxy, multi-comptes ChatGPT Pro.
+
+Routage modèle (via un routeur local par compte) :
+  chat principal            -> claude-opus-5[1m] (api.anthropic.com, OAuth Max, 1M ctx)
+  sub-agents opus/fable     -> gpt-5.6-sol       (proxy Codex)
+  sub-agents sonnet         -> gpt-5.6-terra     (proxy Codex)
+  sub-agents haiku          -> gpt-5.6-luna      (proxy Codex)
+  sub-agents sans modèle    -> gpt-5.6-sol       (natifs ET customs : le routeur
+                               whiteliste le system prompt du chat principal et
+                               de la compaction, tout le reste part sur GPT)
+
+Le chat principal reste sur un vrai modèle Anthropic pour que la compaction et
+le reste du harness Claude Code se comportent normalement ; tout le travail
+délégué part sur les modèles GPT du proxy.
+
+Usage:
+  clg [args claude...]              compte @a si un seul, sinon round-robin @auto
+  clg @b [args claude...]           force le compte "b"
+  clg @auto [args claude...]        round-robin entre les comptes authentifiés
+  clg @list                         état des comptes + proxies
+  CLG_ACCOUNT=b clg ...             équivalent à clg @b
+
+Comptes gérés par `clg-account add <nom>` : une instance de proxy par compte,
+chacune sur son propre port (CCP_CONFIG_DIR isole l'auth). Chaque compte a son
+propre plafond de sessions Codex — le 403 "WebSocket upgrade was rejected"
+tombe par compte, donc répartir les sessions double la capacité.
+
+L'OAuth Anthropic est lu dans le Keychain ("Claude Code-credentials") à chaque
+requête opus. S'il expire, lancer une session `claude` normale le rafraîchit.
+"""
+import http.client
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = pathlib.Path.home()
+CFG_DIR = HOME / ".config" / "clg"
+REGISTRY = CFG_DIR / "accounts.json"
+STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME", str(HOME / ".local/state"))) / "claude-code-proxy"
+PROXY_BIN = shutil.which("claude-code-proxy") or "/opt/homebrew/bin/claude-code-proxy"
+BREW_FORMULA = "raine/claude-code-proxy/claude-code-proxy"
+DEFAULT_REGISTRY = {
+    "a": {"dir": str(HOME / ".config/claude-code-proxy"), "port": 18765, "brew": True},
+}
+
+ROUTER_PORT_OFFSET = 10000
+MAIN_MODEL = "claude-opus-5"
+# [1m] force la fenêtre de contexte 1M côté CLI (sinon l'auth "API" clampe à
+# 200k -> compaction permanente). Vérifié : l'API accepte >400k tokens en OAuth
+# Max sur claude-opus-5. Le routeur retire le suffixe avant l'envoi.
+MAIN_MODEL_ENV = "claude-opus-5[1m]"
+# Whitelist : seules les requêtes du chat principal (et sa compaction) vont chez
+# Anthropic. Les blocs system observés sont [billing-header, identité, corps] et
+# l'identité est partagée par main et sub-agents — le discriminant fiable est le
+# corps : la boucle principale contient "You are an interactive agent", la
+# compaction son prompt summarizer. Tout le reste (sub-agents natifs "You are an
+# agent for...", customs avec leur propre prompt) part sur GPT.
+MAIN_SYSTEM_MARKERS = (
+    "You are an interactive agent",
+    "You are a helpful AI assistant tasked with summarizing conversations",
+)
+SOL = "gpt-5.6-sol"
+TERRA = "gpt-5.6-terra"
+LUNA = "gpt-5.6-luna"
+ANTHROPIC_HOST = "api.anthropic.com"
+OAUTH_BETA = "oauth-2025-04-20"
+
+
+def load_registry() -> dict:
+    reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+    for name, acc in DEFAULT_REGISTRY.items():
+        reg.setdefault(name, acc)
+    return reg
+
+
+# ---------------------------------------------------------------------------
+# Routeur local : opus du chat -> Anthropic, tout le reste -> proxy Codex.
+# ---------------------------------------------------------------------------
+
+_token_cache: tuple[str, float] | None = None
+
+
+def read_oauth() -> dict:
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return json.loads(out.stdout.strip()).get("claudeAiOauth") or {}
+    except Exception:
+        pass
+    try:
+        data = json.loads((HOME / ".claude/.credentials.json").read_text())
+        return data.get("claudeAiOauth") or {}
+    except Exception:
+        return {}
+
+
+def oauth_token() -> str | None:
+    global _token_cache
+    now = time.time()
+    if _token_cache and now - _token_cache[1] < 60:
+        return _token_cache[0]
+    token = read_oauth().get("accessToken")
+    _token_cache = (token, now)
+    return token
+
+
+def system_blocks(payload: dict) -> list[str]:
+    system = payload.get("system")
+    if isinstance(system, str):
+        return [system]
+    if isinstance(system, list):
+        return [b.get("text", "") or "" for b in system if isinstance(b, dict)]
+    return []
+
+
+def main_chat_request(payload: dict) -> bool:
+    """Vrai si la requête vient du chat principal (ou de sa compaction)."""
+    for block in system_blocks(payload)[:4]:
+        if any(marker in block[:500] for marker in MAIN_SYSTEM_MARKERS):
+            return True
+    return False
+
+
+def route_model(model: str, payload: dict) -> tuple[str, str]:
+    """-> (destination, modèle effectif). Seul le chat principal va chez Anthropic."""
+    model = model.replace("[1m]", "")
+    if model == MAIN_MODEL:
+        # Seul le chat principal (ou sa compaction) va chez Anthropic ; tout
+        # sub-agent — natif ou custom — qui hérite du modèle part sur GPT.
+        if main_chat_request(payload):
+            return "anthropic", model
+        return "proxy", SOL
+    if model.startswith(("claude-opus", "opus", "claude-fable", "fable")):
+        return "proxy", SOL
+    return "proxy", model
+
+
+class RouterHandler(BaseHTTPRequestHandler):
+    # HTTP/1.0 + Connection: close — réponses délimitées par EOF, streaming SSE
+    # relayé chunk par chunk sans ré-encodage.
+    protocol_version = "HTTP/1.0"
+
+    def _relay(self) -> None:
+        global _token_cache
+        if self.path == "/__clg":
+            payload = json.dumps({"router": "ok", "main": MAIN_MODEL}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        target = "proxy"
+        if body:
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and isinstance(payload.get("model"), str):
+                target, model = route_model(payload["model"], payload)
+                sys.stderr.write(
+                    "route %-9s %-22s sys=%r\n"
+                    % (target, payload["model"], [b[:50] for b in system_blocks(payload)[:3]])
+                )
+                if model != payload["model"]:
+                    payload["model"] = model
+                    body = json.dumps(payload).encode()
+
+        headers = {}
+        for key, value in self.headers.items():
+            low = key.lower()
+            if low in ("host", "content-length", "connection", "transfer-encoding", "accept-encoding", "keep-alive"):
+                continue
+            if target == "anthropic" and low in ("authorization", "x-api-key"):
+                continue
+            headers[key] = value
+        if target == "anthropic":
+            token = oauth_token()
+            if not token:
+                self._error(502, "clg-router: OAuth Anthropic introuvable (Keychain 'Claude Code-credentials'). Lance `claude` une fois pour te ré-authentifier.")
+                return
+            headers["authorization"] = f"Bearer {token}"
+            beta = headers.pop("anthropic-beta", None) or headers.pop("Anthropic-Beta", None)
+            headers["anthropic-beta"] = f"{beta},{OAUTH_BETA}" if beta and OAUTH_BETA not in beta else (beta or OAUTH_BETA)
+        if body:
+            headers["Content-Length"] = str(len(body))
+
+        try:
+            if target == "anthropic":
+                conn = http.client.HTTPSConnection(ANTHROPIC_HOST, timeout=600)
+            else:
+                conn = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=600)
+            conn.request(self.command, self.path, body=body or None, headers=headers)
+            resp = conn.getresponse()
+        except Exception as exc:
+            self._error(502, f"clg-router: upstream {target} injoignable: {exc}")
+            return
+
+        if target == "anthropic" and resp.status == 401:
+            _token_cache = None  # token périmé : relire le Keychain à la prochaine requête
+
+        self.send_response(resp.status)
+        for key, value in resp.getheaders():
+            if key.lower() in ("transfer-encoding", "connection", "content-length", "keep-alive"):
+                continue
+            self.send_header(key, value)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            conn.close()
+
+    def _error(self, status: int, message: str) -> None:
+        payload = json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _relay
+
+    def log_message(self, fmt, *args):  # journal minimal dans le log du routeur
+        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+
+
+def run_router(listen_port: int, upstream_port: int) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", listen_port), RouterHandler)
+    server.upstream_port = upstream_port
+    server.serve_forever()
+
+
+def router_healthy(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/__clg", timeout=2) as r:
+            return r.status == 200 and MAIN_MODEL in r.read().decode()
+    except Exception:
+        return False
+
+
+def start_router(name: str, acc: dict) -> bool:
+    rport = acc["port"] + ROUTER_PORT_OFFSET
+    if router_healthy(rport):
+        return True
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / f"clg-router-{name}.log", "a") as log:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "__router", str(rport), str(acc["port"])],
+            stdout=log, stderr=log, start_new_session=True,
+        )
+    for _ in range(20):
+        if router_healthy(rport):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Proxy Codex (inchangé) + lanceur.
+# ---------------------------------------------------------------------------
+
+def proxy_healthy(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2) as r:
+            catalog = r.read().decode()
+    except Exception:
+        return False
+    return all(m in catalog for m in (f'"{SOL}"', f'"{TERRA}"', f'"{LUNA}"'))
+
+
+def start_proxy(name: str, acc: dict) -> bool:
+    port = acc["port"]
+    if proxy_healthy(port):
+        return True
+    if acc.get("brew"):
+        subprocess.run(
+            ["brew", "services", "restart", BREW_FORMULA],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    if not proxy_healthy(port) and os.access(PROXY_BIN, os.X_OK):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, CCP_CONFIG_DIR=acc["dir"])
+        with open(STATE_DIR / f"clg-{name}.log", "a") as log:
+            subprocess.Popen(
+                [PROXY_BIN, "serve", "--no-monitor", "--port", str(port)],
+                stdout=log, stderr=log, env=env, start_new_session=True,
+            )
+    for _ in range(40):
+        if proxy_healthy(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def has_auth(acc: dict) -> bool:
+    return (pathlib.Path(acc["dir"]) / "codex" / "auth.json").exists()
+
+
+def pick_auto(reg: dict) -> str:
+    candidates = [n for n, a in sorted(reg.items()) if has_auth(a)]
+    if not candidates:
+        candidates = sorted(reg)
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    rr = CFG_DIR / "rr-state"
+    try:
+        i = int(rr.read_text().strip())
+    except Exception:
+        i = 0
+    name = candidates[i % len(candidates)]
+    rr.write_text(str(i + 1))
+    return name
+
+
+def print_status(reg: dict) -> None:
+    oauth = read_oauth()
+    expires = oauth.get("expiresAt", 0)
+    if not oauth.get("accessToken"):
+        print("OAuth Anthropic (chat opus) : ABSENT — lance `claude` une fois pour t'authentifier")
+    else:
+        state = "valide" if expires / 1000 > time.time() else "EXPIRÉ — lance `claude` une fois pour le rafraîchir"
+        print(f"OAuth Anthropic (chat opus) : {state} · plan {oauth.get('subscriptionType', '?')}")
+    for name, acc in sorted(reg.items()):
+        health = "proxy UP" if proxy_healthy(acc["port"]) else "proxy down (démarré à la demande)"
+        rport = acc["port"] + ROUTER_PORT_OFFSET
+        router = "routeur UP" if router_healthy(rport) else "routeur down (démarré à la demande)"
+        out = subprocess.run(
+            [PROXY_BIN, "codex", "auth", "status"],
+            capture_output=True, text=True,
+            env=dict(os.environ, CCP_CONFIG_DIR=acc["dir"]),
+        )
+        auth = " · ".join(line.strip() for line in out.stdout.splitlines()[:2]) or out.stderr.strip()
+        if not has_auth(acc) and not acc.get("brew"):
+            auth = f"NON AUTHENTIFIÉ (clg-account add {name}) — attention: fallback silencieux sur le compte par défaut"
+        print(f"@{name}  port {acc['port']}  {health}  ·  port {rport}  {router}\n    {auth}")
+
+
+def resolve_claude_bin() -> str:
+    override = os.environ.get("CLG_CLAUDE_BIN_OVERRIDE")
+    candidates = [override] if override else []
+    which = shutil.which("claude")
+    if which:
+        candidates.append(which)
+    candidates += [str(HOME / ".local/bin/claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+    for c in candidates:
+        if c and os.access(c, os.X_OK):
+            return os.path.realpath(c)
+    sys.exit("clg: Claude Code est introuvable. Définissez CLG_CLAUDE_BIN_OVERRIDE si nécessaire.")
+
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if args and args[0] == "__router":
+        run_router(int(args[1]), int(args[2]))
+        return
+
+    reg = load_registry()
+
+    selector = os.environ.get("CLG_ACCOUNT", "")
+    if args and args[0].startswith("@"):
+        selector = args[0][1:]
+        args = args[1:]
+
+    if selector in ("list", "status"):
+        print_status(reg)
+        return
+
+    if not selector:
+        selector = "a" if len(reg) == 1 else "auto"
+    if selector == "auto":
+        selector = pick_auto(reg)
+    if selector not in reg:
+        sys.exit(
+            f"clg: compte inconnu '@{selector}'. Comptes: "
+            + ", ".join("@" + n for n in sorted(reg))
+            + f". Ajouter: clg-account add {selector}"
+        )
+
+    acc = reg[selector]
+    if len(reg) > 1:
+        print(f"clg: compte @{selector} (port {acc['port']})", file=sys.stderr)
+    if not start_proxy(selector, acc):
+        sys.exit(
+            f"clg: claude-code-proxy du compte @{selector} n'est pas sain sur le port {acc['port']}.\n"
+            f"clg: log: {STATE_DIR}/clg-{selector}.log — auth: clg-account status"
+        )
+    if not start_router(selector, acc):
+        sys.exit(
+            f"clg: routeur du compte @{selector} n'est pas sain sur le port {acc['port'] + ROUTER_PORT_OFFSET}.\n"
+            f"clg: log: {STATE_DIR}/clg-router-{selector}.log"
+        )
+
+    oauth = read_oauth()
+    if not oauth.get("accessToken"):
+        print("clg: ATTENTION — OAuth Anthropic absent : le chat opus échouera. Lance `claude` une fois.", file=sys.stderr)
+    elif oauth.get("expiresAt", 0) / 1000 < time.time():
+        print("clg: ATTENTION — OAuth Anthropic expiré : lance `claude` une fois pour le rafraîchir.", file=sys.stderr)
+
+    rport = acc["port"] + ROUTER_PORT_OFFSET
+    env = os.environ.copy()
+    # Tiers explicites : le chat reste sur un vrai Opus Anthropic (compaction et
+    # harness natifs), tous les sub-agents partent sur les modèles GPT du proxy.
+    for var in (
+        "ANTHROPIC_API_KEY", "CLAUDE_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        "DISABLE_AUTO_COMPACT", "DISABLE_COMPACT",
+        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    ):
+        env.pop(var, None)
+    env.update(
+        ANTHROPIC_BASE_URL=f"http://127.0.0.1:{rport}",
+        ANTHROPIC_AUTH_TOKEN="unused",
+        ANTHROPIC_MODEL=MAIN_MODEL_ENV,
+        ANTHROPIC_DEFAULT_OPUS_MODEL=SOL,
+        ANTHROPIC_DEFAULT_SONNET_MODEL=TERRA,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL=LUNA,
+        ANTHROPIC_SMALL_FAST_MODEL=LUNA,
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="0",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+        CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1",
+    )
+
+    print(
+        f"clg: chat={MAIN_MODEL_ENV} (Anthropic réel, contexte 1M) · sub-agents GPT: opus/fable/hérité→{SOL}, sonnet→{TERRA}, haiku→{LUNA}",
+        file=sys.stderr,
+    )
+
+    # Keep teammates in this process so they inherit the proxy authentication and
+    # tier mappings exactly. Print mode is headless: Remote Control's first-party
+    # WebSocket is both unnecessary and incompatible with the proxy auth token.
+    launch = ["--teammate-mode", "in-process", "--dangerously-skip-permissions"]
+    if not any(a in ("-p", "--print") for a in args):
+        launch = ["--remote-control", *launch]
+
+    claude = resolve_claude_bin()
+    os.execve(claude, [claude, *launch, *args], env)
+
+
+if __name__ == "__main__":
+    main()

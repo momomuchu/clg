@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Run many `clg -p` prompts with capped concurrency + retry on the transient
+Codex 403 "WebSocket upgrade was rejected" (per-account concurrent-session cap).
+
+Usage:
+  clg-fleet [-j N] [-r RETRIES] prompt-file [prompt-file ...]
+Each prompt-file contains one full prompt (the text passed to `clg -p`).
+Logs land next to each prompt file as <name>.out.log
+"""
+import argparse, subprocess, sys, time, threading, queue, pathlib
+
+def run_one(path: pathlib.Path, retries: int) -> bool:
+    prompt = path.read_text()
+    log = path.with_suffix(path.suffix + ".out.log")
+    for attempt in range(1, retries + 2):
+        with log.open("a") as fh:
+            fh.write(f"\n===== attempt {attempt} @ {time.strftime('%F %T')} =====\n")
+            fh.flush()
+            rc = subprocess.run(
+                ["clg", "-p", prompt], stdout=fh, stderr=subprocess.STDOUT
+            ).returncode
+        if rc == 0:
+            print(f"[OK] {path.name} (attempt {attempt})")
+            return True
+        tail = log.read_text()[-2000:]
+        transient = "403" in tail or "WebSocket upgrade" in tail or "/login" in tail
+        print(f"[FAIL rc={rc}] {path.name} attempt {attempt}"
+              + (" (transient 403, will retry)" if transient and attempt <= retries else ""))
+        if not transient or attempt > retries:
+            return False
+        time.sleep(30 * attempt)  # backoff: let the Codex session cap drain
+    return False
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-j", "--jobs", type=int, default=3,
+                    help="max concurrent clg sessions (default 3 — 9 at once triggers the 403 cap)")
+    ap.add_argument("-r", "--retries", type=int, default=2)
+    ap.add_argument("files", nargs="+", type=pathlib.Path)
+    args = ap.parse_args()
+
+    q: "queue.Queue[pathlib.Path]" = queue.Queue()
+    for f in args.files:
+        q.put(f)
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            try:
+                f = q.get_nowait()
+            except queue.Empty:
+                return
+            if not run_one(f, args.retries):
+                with lock:
+                    failures.append(f.name)
+            q.task_done()
+
+    threads = [threading.Thread(target=worker) for _ in range(min(args.jobs, len(args.files)))]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    if failures:
+        print(f"\nFAILED: {', '.join(failures)}", file=sys.stderr)
+        return 1
+    print("\nAll prompts completed.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
