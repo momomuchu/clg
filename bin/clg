@@ -7,9 +7,8 @@ Routage modèle (via un routeur local par compte) :
   sub-agents opus/fable     -> gpt-5.6-sol       (proxy Codex)
   sub-agents sonnet         -> gpt-5.6-terra     (proxy Codex)
   sub-agents haiku          -> gpt-5.6-luna      (proxy Codex)
-  sub-agents sans modèle    -> gpt-5.6-sol       (natifs ET customs : le routeur
-                               whiteliste le system prompt du chat principal et
-                               de la compaction, tout le reste part sur GPT)
+  sub-agents sans modèle    -> gpt-5.6-terra     (le tier sonnet est résolu ; natifs
+                               et customs hors chat principal partent sur GPT)
 
 Le chat principal reste sur un vrai modèle Anthropic pour que la compaction et
 le reste du harness Claude Code se comportent normalement ; tout le travail
@@ -172,9 +171,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                 payload = None
             if isinstance(payload, dict) and isinstance(payload.get("model"), str):
                 target, model = route_model(payload["model"], payload)
+                display_model = payload["model"] if model == payload["model"] else f"{payload['model']} -> {model}"
                 sys.stderr.write(
                     "route %-9s %-22s sys=%r\n"
-                    % (target, payload["model"], [b[:50] for b in system_blocks(payload)[:3]])
+                    % (target, display_model, [b[:50] for b in system_blocks(payload)[:3]])
                 )
                 if model != payload["model"]:
                     payload["model"] = model
@@ -213,14 +213,14 @@ class RouterHandler(BaseHTTPRequestHandler):
         if target == "anthropic" and resp.status == 401:
             _token_cache = None  # token périmé : relire le Keychain à la prochaine requête
 
-        self.send_response(resp.status)
-        for key, value in resp.getheaders():
-            if key.lower() in ("transfer-encoding", "connection", "content-length", "keep-alive"):
-                continue
-            self.send_header(key, value)
-        self.send_header("Connection", "close")
-        self.end_headers()
         try:
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                if key.lower() in ("transfer-encoding", "connection", "content-length", "keep-alive"):
+                    continue
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
             while True:
                 chunk = resp.read1(65536)
                 if not chunk:
@@ -443,7 +443,7 @@ def main() -> None:
     )
 
     print(
-        f"clg: chat={MAIN_MODEL_ENV} (Anthropic réel, contexte 1M) · sub-agents GPT: opus/fable/hérité→{SOL}, sonnet→{TERRA}, haiku→{LUNA}",
+        f"clg: chat={MAIN_MODEL_ENV} (Anthropic réel, contexte 1M) · sub-agents GPT: opus/fable→{SOL}, sans modèle/sonnet→{TERRA}, haiku→{LUNA}",
         file=sys.stderr,
     )
 
