@@ -61,6 +61,8 @@ class RunningRouter:
         *,
         initial_permits: int = 6,
         anthropic_port: int | None = None,
+        route_logger: object | None = None,
+        proxy_connection_factory: object | None = None,
     ) -> None:
         anthropic_factory = None
         if anthropic_port is not None:
@@ -74,7 +76,8 @@ class RunningRouter:
             anthropic_connection_factory=anthropic_factory,
             retry_sleeper=lambda _delay: None,
             jitter_source=lambda: 0.0,
-            route_logger=lambda _message: None,
+            route_logger=route_logger or (lambda _message: None),
+            proxy_connection_factory=proxy_connection_factory,
         )
         self.server.suppress_logs = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -93,15 +96,13 @@ class RunningRouter:
         self.thread.join(timeout=2)
 
 
-def request(port: int, payload: dict[str, object]) -> tuple[int, bytes]:
+def request(port: int, payload: dict[str, object], path: str = "/v1/messages", method: str = "POST") -> tuple[int, bytes]:
     body = json.dumps(payload).encode()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     try:
         conn.request(
-            "POST",
-            "/v1/messages",
-            body=body,
-            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+            method, path, body=body if method != "GET" else None,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))} if method != "GET" else {},
         )
         response = conn.getresponse()
         return response.status, response.read()
@@ -358,9 +359,9 @@ class RouterTests(unittest.TestCase):
         ) as router:
             status, body = request(router.port, proxy_payload())
 
-        self.assertEqual(RejectingStub.requests, clg.MAX_PROXY_ATTEMPTS)
+        self.assertEqual(RejectingStub.requests, 1)
         self.assertEqual(status, 403)
-        self.assertEqual(body, b"WebSocket upgrade was rejected attempt-4")
+        self.assertEqual(body, b"WebSocket upgrade was rejected attempt-1")
 
     def test_aimd_additive_increase_is_bounded(self) -> None:
         scheduler = clg.UpstreamScheduler([{"name": "a", "port": 1}], initial_permits=3)
@@ -399,6 +400,212 @@ class RouterTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
+
+
+    def test_permit_is_released_when_logger_or_close_fails(self) -> None:
+        class SuccessStub(QuietHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+        with StubServer(SuccessStub) as upstream, RunningRouter(
+            [{"name": "a", "port": upstream.port}], route_logger=lambda _msg: (_ for _ in ()).throw(OSError("log closed"))
+        ) as router:
+            status, _body = request(router.port, proxy_payload())
+            self.assertEqual(status, 502)
+            self.assertEqual(router.server.scheduler.snapshot()[0]["inflight"], 0)
+
+        class CloseFails:
+            def __init__(self, port: int) -> None:
+                self.conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            def request(self, *args: object, **kwargs: object) -> None:
+                self.conn.request(*args, **kwargs)
+            def getresponse(self) -> http.client.HTTPResponse:
+                return self.conn.getresponse()
+            def close(self) -> None:
+                self.conn.close()
+                raise OSError("close failed")
+
+        with StubServer(SuccessStub) as upstream, RunningRouter(
+            [{"name": "a", "port": upstream.port}], proxy_connection_factory=CloseFails
+        ) as router:
+            self.assertEqual(request(router.port, proxy_payload())[0], 200)
+            self.assertEqual(router.server.scheduler.snapshot()[0]["inflight"], 0)
+
+    def test_fifo_timeout_and_monotonic_aimd(self) -> None:
+        scheduler = clg.UpstreamScheduler([{"name": "a", "port": 1}], initial_permits=1)
+        held = scheduler.acquire()
+        order: list[str] = []
+        acquired: list[object] = []
+        def wait(name: str) -> None:
+            upstream = scheduler.acquire()
+            acquired.append(upstream)
+            order.append(name)
+        first = threading.Thread(target=wait, args=("first",))
+        second = threading.Thread(target=wait, args=("second",))
+        first.start(); second.start(); time.sleep(0.05)
+        scheduler.release(held)
+        first.join(1)
+        self.assertEqual(order, ["first"])
+        self.assertRaises(TimeoutError, scheduler.acquire, timeout=0)
+        self.assertEqual(scheduler.snapshot()[0]["inflight"], 1)
+        lone = clg.UpstreamScheduler([{"name": "only", "port": 2}], initial_permits=1)
+        retry_outcome: list[str] = []
+        def reject_same_upstream() -> None:
+            try:
+                retried = lone.acquire(avoid_name="only", timeout=0.05)
+            except TimeoutError:
+                retry_outcome.append("timeout")
+            else:
+                retry_outcome.append("same-upstream")
+                lone.release(retried)
+        retry_thread = threading.Thread(target=reject_same_upstream)
+        retry_thread.start(); retry_thread.join(1)
+        self.assertEqual(retry_outcome, ["timeout"])
+        scheduler.release(acquired.pop())
+        second.join(1)
+        self.assertEqual(order, ["first", "second"])
+        scheduler.release(acquired.pop())
+        scheduler._upstreams[0].permits = clg.MAX_PERMITS + 3
+        for _ in range(clg.SUCCESS_WINDOW):
+            scheduler.succeeded(scheduler._upstreams[0])
+        self.assertEqual(scheduler.snapshot()[0]["permits"], clg.MAX_PERMITS + 3)
+
+    def test_wire_routing_fails_safe_for_malformed_inputs(self) -> None:
+        class ProxyStub(QuietHandler):
+            requests = 0
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+        class AnthropicStub(QuietHandler):
+            requests = 0
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"no")
+        original = clg.oauth_token; clg.oauth_token = lambda: "token"
+        try:
+            with StubServer(ProxyStub) as proxy, StubServer(AnthropicStub) as anth, RunningRouter(
+                [{"name": "a", "port": proxy.port}], anthropic_port=anth.port
+            ) as router:
+                cases = [
+                    {"model": "claude-opus-5[1m][1m]", "system": "You are an interactive agent"},
+                    {"system": "You are an interactive agent"},
+                    {"model": "claude-opus-5", "system": [{"text": {"x": 1}}]},
+                    {"model": "claude-opus-5", "system": "plain string"},
+                ]
+                for payload in cases:
+                    self.assertEqual(request(router.port, payload)[0], 200)
+        finally:
+            clg.oauth_token = original
+        self.assertEqual(ProxyStub.requests, 4)
+        self.assertEqual(AnthropicStub.requests, 0)
+
+    def test_content_length_limits_and_socket_timeout_are_configured(self) -> None:
+        class Unused(QuietHandler): pass
+        with StubServer(Unused) as upstream, RunningRouter([{"name": "a", "port": upstream.port}]) as router:
+            sock = __import__("socket").create_connection(("127.0.0.1", router.port))
+            try:
+                sock.sendall(b"POST /v1/messages HTTP/1.0\r\nContent-Length: nope\r\n\r\n")
+                self.assertIn(b"400", sock.recv(1024))
+            finally:
+                sock.close()
+            sock = __import__("socket").create_connection(("127.0.0.1", router.port))
+            try:
+                sock.sendall(f"POST /v1/messages HTTP/1.0\r\nContent-Length: {clg.MAX_REQUEST_BODY_BYTES + 1}\r\n\r\n".encode())
+                self.assertIn(b"413", sock.recv(1024))
+            finally:
+                sock.close()
+        self.assertEqual(clg.SOCKET_READ_TIMEOUT_SECONDS, 600)
+
+    def test_non_generation_bypasses_permits_and_aimd(self) -> None:
+        class Stub(QuietHandler):
+            def do_GET(self) -> None:
+                self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+        with StubServer(Stub) as upstream, RunningRouter([{"name": "a", "port": upstream.port}], initial_permits=1) as router:
+            state = router.server.scheduler._upstreams[0]
+            state.inflight = 1
+            for _ in range(clg.SUCCESS_WINDOW):
+                self.assertEqual(request(router.port, {}, "/v1/messages/count_tokens")[0], 200)
+            self.assertEqual(request(router.port, {}, "/v1/models", "GET")[0], 200)
+            self.assertEqual(router.server.scheduler.snapshot()[0]["inflight"], 1)
+            self.assertEqual(router.server.scheduler.snapshot()[0]["successes"], 0)
+            self.assertEqual(router.server.scheduler.snapshot()[0]["permits"], 1)
+
+    def test_stream_truncation_and_client_disconnect_release_permit_without_aimd_success(self) -> None:
+        class TruncatedResponse:
+            status = 200
+            def getheaders(self) -> list[tuple[str, str]]: return []
+            def read1(self, _size: int) -> bytes: raise http.client.IncompleteRead(b"partial", 10)
+        class TruncatedConnection:
+            def __init__(self, _port: int) -> None: pass
+            def request(self, *_args: object, **_kwargs: object) -> None: pass
+            def getresponse(self) -> TruncatedResponse: return TruncatedResponse()
+            def close(self) -> None: pass
+        with StubServer(QuietHandler) as upstream, RunningRouter(
+            [{"name":"a", "port": upstream.port}], proxy_connection_factory=TruncatedConnection
+        ) as router:
+            status, _body = request(router.port, proxy_payload())
+            state = router.server.scheduler.snapshot()[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(state["inflight"], 0)
+        self.assertEqual(state["successes"], 0)
+
+        class LargeStream(QuietHandler):
+            def handle(self) -> None:
+                try:
+                    super().handle()
+                except ConnectionResetError:
+                    pass
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200); self.end_headers()
+                for _ in range(30):
+                    try:
+                        self.wfile.write(b"x" * 65536); self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+        with StubServer(LargeStream) as upstream, RunningRouter([{"name":"a", "port":upstream.port}]) as router:
+            conn = __import__("socket").create_connection(("127.0.0.1", router.port))
+            conn.sendall(b"POST /v1/messages HTTP/1.0\r\nContent-Length: 2\r\n\r\n{}")
+            conn.recv(128); conn.close(); time.sleep(0.1)
+            state = router.server.scheduler.snapshot()[0]
+        self.assertEqual(state["inflight"], 0)
+        self.assertEqual(state["successes"], 0)
+
+    def test_oauth_cache_invalidation_is_compare_and_swap(self) -> None:
+        clg._token_cache = ("fresh", time.time())
+        clg.invalidate_oauth_token("stale")
+        self.assertEqual(clg._token_cache[0], "fresh")
+        clg.invalidate_oauth_token("fresh")
+        self.assertIsNone(clg._token_cache)
+
+    def test_pinned_compatibility_router_delegates_to_shared_scheduler(self) -> None:
+        class A(QuietHandler):
+            def do_POST(self) -> None: self.send_response(500); self.send_header("Content-Length", "0"); self.end_headers()
+        class B(QuietHandler):
+            requests = 0
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+        with StubServer(A) as a, StubServer(B) as b, RunningRouter([{"name":"a","port":a.port},{"name":"b","port":b.port}]) as shared:
+            relay = clg.RouterServer(("127.0.0.1", 0), [{"name":"a","port":a.port},{"name":"b","port":b.port}], delegate_port=shared.port, pinned_upstream="b")
+            thread = threading.Thread(target=relay.serve_forever, daemon=True); thread.start()
+            try:
+                self.assertEqual(request(relay.server_address[1], proxy_payload())[0], 200)
+                self.assertEqual(B.requests, 1)
+                self.assertEqual(relay.scheduler.snapshot()[1]["inflight"], 0)
+                self.assertEqual(shared.server.scheduler.snapshot()[1]["inflight"], 0)
+            finally:
+                relay.shutdown(); relay.server_close(); thread.join(2)
 
 
 if __name__ == "__main__":

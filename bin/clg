@@ -59,6 +59,9 @@ DEFAULT_REGISTRY = {
 
 ROUTER_PORT_OFFSET = 10000
 SHARED_ROUTER_PORT = 28765
+MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+SOCKET_READ_TIMEOUT_SECONDS = 600
+PINNED_UPSTREAM_HEADER = "X-CLG-Pinned-Upstream"
 INITIAL_PERMITS = 6
 MIN_PERMITS = 2
 MAX_PERMITS = 12
@@ -102,7 +105,8 @@ def load_registry() -> dict:
 # Routeur local : opus du chat -> Anthropic, tout le reste -> proxy Codex.
 # ---------------------------------------------------------------------------
 
-_token_cache: tuple[str, float] | None = None
+_token_cache: tuple[str | None, float] | None = None
+_token_lock = threading.Lock()
 
 
 def read_oauth() -> dict:
@@ -124,12 +128,20 @@ def read_oauth() -> dict:
 
 def oauth_token() -> str | None:
     global _token_cache
-    now = time.time()
-    if _token_cache and now - _token_cache[1] < 60:
-        return _token_cache[0]
-    token = read_oauth().get("accessToken")
-    _token_cache = (token, now)
-    return token
+    with _token_lock:
+        now = time.time()
+        if _token_cache and now - _token_cache[1] < 60:
+            return _token_cache[0]
+        token = read_oauth().get("accessToken")
+        _token_cache = (token, now)
+        return token
+
+
+def invalidate_oauth_token(token: str) -> None:
+    global _token_cache
+    with _token_lock:
+        if _token_cache is not None and _token_cache[0] == token:
+            _token_cache = None
 
 
 def system_blocks(payload: dict) -> list[str]:
@@ -137,7 +149,8 @@ def system_blocks(payload: dict) -> list[str]:
     if isinstance(system, str):
         return [system]
     if isinstance(system, list):
-        return [b.get("text", "") or "" for b in system if isinstance(b, dict)]
+        return [text for block in system if isinstance(block, dict)
+                if isinstance((text := block.get("text")), str)]
     return []
 
 
@@ -151,7 +164,7 @@ def main_chat_request(payload: dict) -> bool:
 
 def route_model(model: str, payload: dict) -> tuple[str, str]:
     """-> (destination, modèle effectif). Seul le chat principal va chez Anthropic."""
-    model = model.replace("[1m]", "")
+    model = model.removesuffix("[1m]")
     if model == MAIN_MODEL:
         # Seul le chat principal (ou sa compaction) va chez Anthropic ; tout
         # sub-agent — natif ou custom — qui hérite du modèle part sur GPT.
@@ -173,7 +186,7 @@ class UpstreamState:
 
 
 class UpstreamScheduler:
-    """Atomically selects proxy accounts and adapts each account's concurrency."""
+    """FIFO proxy-account selection with per-account adaptive concurrency."""
 
     def __init__(self, upstreams: list[dict], initial_permits: int = INITIAL_PERMITS) -> None:
         if not upstreams:
@@ -183,29 +196,67 @@ class UpstreamScheduler:
             UpstreamState(str(upstream["name"]), int(upstream["port"]), initial_permits)
             for upstream in upstreams
         ]
+        self._tickets: list[int] = []
+        self._next_ticket = 0
 
-    def acquire(self, avoid_name: str | None = None, timeout: float = ACQUIRE_TIMEOUT_SECONDS) -> UpstreamState:
+    def acquire(
+        self,
+        avoid_name: str | None = None,
+        timeout: float = ACQUIRE_TIMEOUT_SECONDS,
+        only_name: str | None = None,
+    ) -> UpstreamState:
         deadline = time.monotonic() + timeout
         with self._condition:
-            while True:
-                available = [
-                    upstream
-                    for upstream in self._upstreams
-                    if upstream.inflight < upstream.permits
-                ]
-                alternatives = [upstream for upstream in available if upstream.name != avoid_name]
-                candidates = alternatives or available
-                if candidates:
-                    upstream = max(
-                        candidates,
-                        key=lambda item: (item.permits - item.inflight, -item.inflight),
-                    )
-                    upstream.inflight += 1
-                    return upstream
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("timed out waiting for proxy capacity")
-                self._condition.wait(remaining)
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._tickets.append(ticket)
+            try:
+                while True:
+                    available = [
+                        upstream for upstream in self._upstreams
+                        if upstream.inflight < upstream.permits
+                    ]
+                    if only_name is not None:
+                        candidates = [upstream for upstream in available if upstream.name == only_name]
+                    elif avoid_name is not None:
+                        candidates = [upstream for upstream in available if upstream.name != avoid_name]
+                    else:
+                        candidates = available
+                    if self._tickets[0] == ticket and candidates:
+                        upstream = max(
+                            candidates,
+                            key=lambda item: (item.permits - item.inflight, -item.inflight),
+                        )
+                        upstream.inflight += 1
+                        self._tickets.pop(0)
+                        self._condition.notify_all()
+                        return upstream
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out waiting for proxy capacity")
+                    self._condition.wait(remaining)
+            finally:
+                if ticket in self._tickets:
+                    self._tickets.remove(ticket)
+                    self._condition.notify_all()
+
+    def has_available_alternative(self, name: str) -> bool:
+        with self._condition:
+            return any(
+                upstream.name != name and upstream.inflight < upstream.permits
+                for upstream in self._upstreams
+            )
+
+    def select_unlimited(self, only_name: str | None = None) -> UpstreamState:
+        """Select an upstream without consuming a generation permit."""
+        with self._condition:
+            candidates = [
+                upstream for upstream in self._upstreams
+                if only_name is None or upstream.name == only_name
+            ]
+            if not candidates:
+                raise ValueError(f"unknown proxy upstream: {only_name}")
+            return max(candidates, key=lambda item: (item.permits - item.inflight, -item.inflight))
 
     def release(self, upstream: UpstreamState) -> None:
         with self._condition:
@@ -222,7 +273,7 @@ class UpstreamScheduler:
         with self._condition:
             upstream.successes += 1
             if upstream.successes >= SUCCESS_WINDOW:
-                upstream.permits = min(upstream.permits + 1, MAX_PERMITS)
+                upstream.permits = max(upstream.permits, min(upstream.permits + 1, MAX_PERMITS))
                 upstream.successes = 0
                 self._condition.notify_all()
 
@@ -258,15 +309,27 @@ class RouterServer(ThreadingHTTPServer):
         retry_sleeper: Callable[[float], None] = time.sleep,
         jitter_source: Callable[[], float] = random.random,
         route_logger: Callable[[str], object] = sys.stderr.write,
+        proxy_connection_factory: Callable[[int], http.client.HTTPConnection] | None = None,
+        delegate_port: int | None = None,
+        pinned_upstream: str | None = None,
     ) -> None:
         self.scheduler = UpstreamScheduler(upstreams, initial_permits)
+        self.delegate_port = delegate_port
+        self.pinned_upstream = pinned_upstream
         self.anthropic_connection_factory = anthropic_connection_factory or (
             lambda: http.client.HTTPSConnection(ANTHROPIC_HOST, timeout=600)
         )
         self.retry_sleeper = retry_sleeper
         self.jitter_source = jitter_source
         self.route_logger = route_logger
+        self.proxy_connection_factory = proxy_connection_factory or (
+            lambda port: http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+        )
         super().__init__(server_address, RouterHandler)
+
+
+class UpstreamStreamError(Exception):
+    pass
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -274,12 +337,22 @@ class RouterHandler(BaseHTTPRequestHandler):
     # relayé chunk par chunk sans ré-encodage.
     protocol_version = "HTTP/1.0"
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(SOCKET_READ_TIMEOUT_SECONDS)
+        self._downstream_committed = False
+
     def _relay(self) -> None:
-        global _token_cache
         if self.path == "/__clg":
             upstreams = self.server.scheduler.snapshot()
             payload = json.dumps(
-                {"router": "ok", "main": MAIN_MODEL, "upstreams": upstreams},
+                {
+                    "router": "ok",
+                    "main": MAIN_MODEL,
+                    "upstreams": upstreams,
+                    "delegate_port": self.server.delegate_port,
+                    "pinned_upstream": self.server.pinned_upstream,
+                },
                 sort_keys=True,
             ).encode()
             self.send_response(200)
@@ -289,8 +362,25 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length) if length else b""
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            length = 0
+        elif not content_length.isascii() or not content_length.isdecimal():
+            self._error(400, "clg-router: Content-Length invalide")
+            return
+        else:
+            length = int(content_length)
+        if length > MAX_REQUEST_BODY_BYTES:
+            self._error(413, "clg-router: corps de requête trop volumineux")
+            return
+        try:
+            body = self.rfile.read(length) if length else b""
+        except TimeoutError:
+            self._error(408, "clg-router: lecture de requête expirée")
+            return
+        if self.server.delegate_port is not None:
+            self._relay_delegate(body)
+            return
         target = "proxy"
         route_details: tuple[str, list[str]] | None = None
         if body:
@@ -307,6 +397,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     body = json.dumps(payload).encode()
 
         headers = self._forward_headers(target, body)
+        pinned_upstream = self.headers.get(PINNED_UPSTREAM_HEADER)
         if target == "anthropic":
             token = oauth_token()
             if not token:
@@ -315,15 +406,15 @@ class RouterHandler(BaseHTTPRequestHandler):
             headers["authorization"] = f"Bearer {token}"
             beta = headers.pop("anthropic-beta", None) or headers.pop("Anthropic-Beta", None)
             headers["anthropic-beta"] = f"{beta},{OAUTH_BETA}" if beta and OAUTH_BETA not in beta else (beta or OAUTH_BETA)
-            self._relay_anthropic(body, headers, route_details)
+            self._relay_anthropic(body, headers, route_details, token)
             return
-        self._relay_proxy(body, headers, route_details)
+        self._relay_proxy(body, headers, route_details, pinned_upstream)
 
     def _forward_headers(self, target: str, body: bytes) -> dict[str, str]:
         headers = {}
         for key, value in self.headers.items():
             low = key.lower()
-            if low in ("host", "content-length", "connection", "transfer-encoding", "accept-encoding", "keep-alive"):
+            if low in ("host", "content-length", "connection", "transfer-encoding", "accept-encoding", "keep-alive", PINNED_UPSTREAM_HEADER.lower()):
                 continue
             if target == "anthropic" and low in ("authorization", "x-api-key"):
                 continue
@@ -352,8 +443,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         body: bytes,
         headers: dict[str, str],
         route_details: tuple[str, list[str]] | None,
+        token: str,
     ) -> None:
-        global _token_cache
         conn = self.server.anthropic_connection_factory()
         self._log_route("anthropic", route_details, ANTHROPIC_HOST, 1)
         try:
@@ -364,91 +455,145 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._error(502, f"clg-router: upstream anthropic injoignable: {exc}")
             return
         if response.status == 401:
-            _token_cache = None
+            invalidate_oauth_token(token)
         try:
             self._send_response(response)
         finally:
             conn.close()
+
+    def _relay_delegate(self, body: bytes) -> None:
+        """Compatibility listener which delegates pinning to the shared scheduler."""
+        headers = self._forward_headers("proxy", body)
+        headers[PINNED_UPSTREAM_HEADER] = self.server.pinned_upstream
+        conn = self.server.proxy_connection_factory(self.server.delegate_port)
+        try:
+            conn.request(self.command, self.path, body=body or None, headers=headers)
+            self._send_response(conn.getresponse())
+        except UpstreamStreamError:
+            if not self._downstream_committed:
+                self._error(502, "clg-router: flux proxy tronqué")
+        except Exception as exc:
+            if not self._downstream_committed:
+                self._error(502, f"clg-router: routeur partagé injoignable: {exc}")
+        finally:
+            conn.close()
+
+    def _is_generation_request(self) -> bool:
+        return self.command == "POST" and self.path == "/v1/messages"
 
     def _relay_proxy(
         self,
         body: bytes,
         headers: dict[str, str],
         route_details: tuple[str, list[str]] | None,
+        pinned_upstream: str | None,
     ) -> None:
+        generation = self._is_generation_request()
         avoid_name = None
         for attempt in range(1, MAX_PROXY_ATTEMPTS + 1):
             try:
-                upstream = self.server.scheduler.acquire(avoid_name=avoid_name)
+                upstream = self.server.scheduler.acquire(
+                    avoid_name=avoid_name,
+                    only_name=pinned_upstream,
+                ) if generation else self.server.scheduler.select_unlimited(pinned_upstream)
             except TimeoutError as exc:
                 self._error(503, f"clg-router: capacité proxy indisponible: {exc}")
                 return
-
-            conn = http.client.HTTPConnection("127.0.0.1", upstream.port, timeout=600)
-            response = None
-            buffered = b""
             retry = False
-            self._log_route("proxy", route_details, upstream.name, attempt)
+            conn = None
             try:
+                conn = self.server.proxy_connection_factory(upstream.port)
+                self._log_route("proxy", route_details, upstream.name, attempt)
                 conn.request(self.command, self.path, body=body or None, headers=headers)
                 response = conn.getresponse()
                 if response.status == 403:
                     content_length = response.getheader("Content-Length")
-                    if content_length is not None and int(content_length) > RETRY_BODY_LIMIT:
-                        self.server.scheduler.failed(upstream)
+                    if content_length is not None and content_length.isdecimal() and int(content_length) > RETRY_BODY_LIMIT:
                         self._send_response(response)
+                        if generation:
+                            self.server.scheduler.failed(upstream)
                     else:
                         buffered = response.read(RETRY_BODY_LIMIT + 1)
-                        if len(buffered) <= RETRY_BODY_LIMIT and b"WebSocket upgrade" in buffered:
+                        rejected = len(buffered) <= RETRY_BODY_LIMIT and b"WebSocket upgrade" in buffered
+                        if rejected and generation:
                             self.server.scheduler.websocket_rejected(upstream)
-                            if attempt < MAX_PROXY_ATTEMPTS:
+                            if (
+                                attempt < MAX_PROXY_ATTEMPTS
+                                and pinned_upstream is None
+                                and self.server.scheduler.has_available_alternative(upstream.name)
+                            ):
                                 retry = True
                                 avoid_name = upstream.name
                             else:
                                 self._send_response(response, buffered)
                         else:
-                            self.server.scheduler.failed(upstream)
                             self._send_response(response, buffered)
+                            if generation:
+                                self.server.scheduler.failed(upstream)
                 else:
-                    self._send_response(response)
-                    if response.status < 400:
-                        self.server.scheduler.succeeded(upstream)
-                    else:
-                        self.server.scheduler.failed(upstream)
+                    completed = self._send_response(response)
+                    if generation:
+                        if completed and response.status < 400:
+                            self.server.scheduler.succeeded(upstream)
+                        else:
+                            self.server.scheduler.failed(upstream)
+            except UpstreamStreamError as exc:
+                if generation:
+                    self.server.scheduler.failed(upstream)
+                if not self._downstream_committed:
+                    self._error(502, f"clg-router: flux proxy @{upstream.name} tronqué: {exc}")
+                return
             except Exception as exc:
-                self._error(502, f"clg-router: upstream proxy @{upstream.name} injoignable: {exc}")
+                if generation:
+                    self.server.scheduler.failed(upstream)
+                if not self._downstream_committed:
+                    self._error(502, f"clg-router: upstream proxy @{upstream.name} injoignable: {exc}")
                 return
             finally:
-                conn.close()
-                self.server.scheduler.release(upstream)
-
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+                finally:
+                    if generation:
+                        self.server.scheduler.release(upstream)
             if not retry:
                 return
             delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1)) + self.server.jitter_source() * RETRY_JITTER_SECONDS
             self.server.retry_sleeper(delay)
 
-    def _send_response(self, response: http.client.HTTPResponse, buffered: bytes = b"") -> None:
-        try:
-            self.send_response(response.status)
-            for key, value in response.getheaders():
-                if key.lower() in ("transfer-encoding", "connection", "content-length", "keep-alive"):
-                    continue
-                self.send_header(key, value)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if buffered:
+    def _send_response(self, response: http.client.HTTPResponse, buffered: bytes = b"") -> bool:
+        self.send_response(response.status)
+        for key, value in response.getheaders():
+            if key.lower() in ("transfer-encoding", "connection", "content-length", "keep-alive"):
+                continue
+            self.send_header(key, value)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self._downstream_committed = True
+        if buffered:
+            try:
                 self.wfile.write(buffered)
                 self.wfile.flush()
-            while True:
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+        while True:
+            try:
                 chunk = response.read1(65536)
-                if not chunk:
-                    break
+            except (http.client.IncompleteRead, ConnectionResetError, OSError) as exc:
+                raise UpstreamStreamError(str(exc)) from exc
+            if not chunk:
+                return True
+            try:
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            except (BrokenPipeError, ConnectionResetError):
+                return False
 
     def _error(self, status: int, message: str) -> None:
+        if self._downstream_committed:
+            return
         payload = json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -464,8 +609,18 @@ class RouterHandler(BaseHTTPRequestHandler):
         sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
 
 
-def run_router(listen_port: int, upstreams: list[dict]) -> None:
-    server = RouterServer(("127.0.0.1", listen_port), upstreams)
+def run_router(
+    listen_port: int,
+    upstreams: list[dict],
+    *,
+    delegate_port: int | None = None,
+    pinned_upstream: str | None = None,
+) -> None:
+    server = RouterServer(
+        ("127.0.0.1", listen_port), upstreams,
+        delegate_port=delegate_port,
+        pinned_upstream=pinned_upstream,
+    )
     server.serve_forever()
 
 
@@ -480,9 +635,17 @@ def router_status(port: int) -> dict | None:
         return None
 
 
-def router_healthy(port: int, expected_upstreams: list[dict] | None = None) -> bool:
+def router_healthy(
+    port: int,
+    expected_upstreams: list[dict] | None = None,
+    *,
+    delegate_port: int | None = None,
+    pinned_upstream: str | None = None,
+) -> bool:
     status = router_status(port)
     if status is None:
+        return False
+    if status.get("delegate_port") != delegate_port or status.get("pinned_upstream") != pinned_upstream:
         return False
     if expected_upstreams is None:
         return True
@@ -530,15 +693,29 @@ def replace_stale_router(port: int) -> bool:
     return False
 
 
-def start_router(name: str, listen_port: int, upstreams: list[dict]) -> bool:
-    if router_healthy(listen_port, upstreams):
+def start_router(
+    name: str,
+    listen_port: int,
+    upstreams: list[dict],
+    *,
+    delegate_port: int | None = None,
+    pinned_upstream: str | None = None,
+) -> bool:
+    if router_healthy(
+        listen_port, upstreams,
+        delegate_port=delegate_port,
+        pinned_upstream=pinned_upstream,
+    ):
         return True
     if router_listener_pid(listen_port) is not None and not replace_stale_router(listen_port):
         return False
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(STATE_DIR / f"clg-router-{name}.log", "a") as log:
         subprocess.Popen(
-            [sys.executable, os.path.realpath(__file__), "__router", str(listen_port), json.dumps(upstreams)],
+            [
+                sys.executable, os.path.realpath(__file__), "__router", str(listen_port), json.dumps(upstreams),
+                json.dumps({"delegate_port": delegate_port, "pinned_upstream": pinned_upstream}),
+            ],
             stdout=log, stderr=log, start_new_session=True,
         )
     for _ in range(20):
@@ -646,7 +823,8 @@ def main() -> None:
     args = sys.argv[1:]
 
     if args and args[0] == "__router":
-        run_router(int(args[1]), json.loads(args[2]))
+        options = json.loads(args[3]) if len(args) > 3 else {}
+        run_router(int(args[1]), json.loads(args[2]), **options)
         return
 
     reg = load_registry()
@@ -671,42 +849,36 @@ def main() -> None:
             + f". Ajouter: clg-account add {selector}"
         )
 
-    if shared:
-        selected = [(name, acc) for name, acc in sorted(reg.items()) if has_auth(acc)]
-        if not selected:
-            sys.exit("clg: aucun compte claude-code-proxy authentifié. Lance `clg-account add <nom>`.")
-        failed = [name for name, acc in selected if not start_proxy(name, acc)]
-        if failed:
-            sys.exit(
-                "clg: proxy non sain pour "
-                + ", ".join("@" + name for name in failed)
-                + f". Logs: {STATE_DIR}/clg-<compte>.log"
-            )
-        upstreams = [{"name": name, "port": acc["port"]} for name, acc in selected]
-        router_name = "shared"
-        rport = SHARED_ROUTER_PORT
-        print(
-            "clg: routeur partagé " + ", ".join(f"@{item['name']}:{item['port']}" for item in upstreams),
-            file=sys.stderr,
+    selected = [(name, acc) for name, acc in sorted(reg.items()) if has_auth(acc)]
+    if not selected:
+        sys.exit("clg: aucun compte claude-code-proxy authentifié. Lance `clg-account add <nom>`.")
+    if not shared and selector not in {name for name, _acc in selected}:
+        sys.exit(f"clg: compte @{selector} non authentifié. Lance `clg-account add {selector}`.")
+    failed = [name for name, acc in selected if not start_proxy(name, acc)]
+    if failed:
+        sys.exit(
+            "clg: proxy non sain pour " + ", ".join("@" + name for name in failed)
+            + f". Logs: {STATE_DIR}/clg-<compte>.log"
         )
+    upstreams = [{"name": name, "port": acc["port"]} for name, acc in selected]
+    if not start_router("shared", SHARED_ROUTER_PORT, upstreams):
+        sys.exit(
+            f"clg: routeur partagé n'est pas sain sur le port {SHARED_ROUTER_PORT}.\n"
+            f"clg: log: {STATE_DIR}/clg-router-shared.log"
+        )
+    if shared:
+        rport = SHARED_ROUTER_PORT
+        print("clg: routeur partagé " + ", ".join(f"@{item['name']}:{item['port']}" for item in upstreams), file=sys.stderr)
     else:
         acc = reg[selector]
-        if explicit_selector or len(reg) > 1:
-            print(f"clg: compte @{selector} (port {acc['port']})", file=sys.stderr)
-        if not start_proxy(selector, acc):
-            sys.exit(
-                f"clg: claude-code-proxy du compte @{selector} n'est pas sain sur le port {acc['port']}.\n"
-                f"clg: log: {STATE_DIR}/clg-{selector}.log — auth: clg-account status"
-            )
-        upstreams = [{"name": selector, "port": acc["port"]}]
-        router_name = selector
         rport = acc["port"] + ROUTER_PORT_OFFSET
-
-    if not start_router(router_name, rport, upstreams):
-        sys.exit(
-            f"clg: routeur {router_name} n'est pas sain sur le port {rport}.\n"
-            f"clg: log: {STATE_DIR}/clg-router-{router_name}.log"
-        )
+        if not start_router(
+            selector, rport, upstreams,
+            delegate_port=SHARED_ROUTER_PORT,
+            pinned_upstream=selector,
+        ):
+            sys.exit(f"clg: relais @{selector} indisponible sur le port {rport}.")
+        print(f"clg: compte @{selector} via routeur partagé (port {rport})", file=sys.stderr)
 
     oauth = read_oauth()
     if not oauth.get("accessToken"):

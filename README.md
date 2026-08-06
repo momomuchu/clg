@@ -33,11 +33,10 @@ flowchart LR
 | Subagents with **no model** (inherited) — native *and* custom agents | `gpt-5.6-terra` | proxy |
 
 The router tells the main thread apart from inherited-model subagents by the
-request's system prompt (whitelist, fail-safe: anything unrecognized goes to GPT, never
-to your Anthropic quota). Every request is logged as a `route …` line, including the
-chosen upstream and attempt number, in
-`~/.local/state/claude-code-proxy/clg-router-shared.log` by default or
-`clg-router-<account>.log` for an explicit account selector.
+request's system prompt (whitelist, fail-safe: anything unrecognized or malformed goes
+to GPT, never to your Anthropic quota). It accepts one exact trailing `[1m]` suffix only.
+Every request is logged as a `route …` line, including the chosen upstream and attempt
+number, in `~/.local/state/claude-code-proxy/clg-router-shared.log`.
 
 The `[1m]` suffix matters: without it Claude Code clamps non-first-party auth to a 200k
 window and compacts constantly. Opus 5 is natively 1M and the API serves it over
@@ -71,12 +70,17 @@ clg-fleet -j 3 p1.txt p2.txt   # batch `clg -p` runs
 
 Each account gets its own proxy instance (isolated `CCP_CONFIG_DIR`). The default shared
 router listens on port `28765`, starts every authenticated account proxy, and picks the
-upstream with the most free capacity for each proxy-bound request. Each upstream starts
+upstream with the most free capacity for each generation request. Each upstream starts
 with 6 permits. A WebSocket-upgrade 403 reduces that upstream's permits by 25% (floor 2)
-and is retried up to 4 total attempts, preferring another account. Every 20 consecutive
-successful responses adds one permit (ceiling 12). Main-chat Anthropic traffic bypasses
-this scheduler. An explicit `@name` keeps the original single-upstream router on
-`account port + 10000`.
+and is retried only when a different account has capacity. Every 20 consecutive completed
+generation responses adds one permit (ceiling 12, without lowering explicitly higher
+settings). `POST /v1/messages/count_tokens`, `GET /v1/models`, and other non-generation
+requests bypass generation permits and AIMD. Requests are capped at 64 MiB and socket
+reads time out after 600 seconds. Main-chat Anthropic traffic bypasses this scheduler.
+
+`clg @name` preserves a pinned-session URL on `account port + 10000`, but that listener
+is a compatibility relay to the shared router: it pins proxy traffic to `@name` while the
+shared router remains the sole owner of permits and AIMD state.
 
 `GET /__clg` reports the configured upstream set plus each upstream's permits, in-flight
 count, free capacity, and current success streak.
