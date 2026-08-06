@@ -3,7 +3,8 @@
 Run Claude Code with a **real Anthropic Opus main thread** (full 1M context, native
 compaction) while **every subagent is served by GPT models** through
 [claude-code-proxy](https://github.com/raine/claude-code-proxy) (ChatGPT Pro / Codex
-backend). Multi-account round-robin included.
+backend). The default shared router schedules each proxy request across every
+authenticated account with adaptive per-account concurrency and targeted retries.
 
 Why: proxied GPT models struggle with Claude Code's harness (compaction, orchestration),
 and pure-Anthropic burns your subscription on bulk subagent work. `clg` gives you the
@@ -11,10 +12,13 @@ best of both — the orchestrator is a genuine Anthropic model, the worker fleet
 
 ```mermaid
 flowchart LR
-    CC[Claude Code] -->|ANTHROPIC_BASE_URL| R[clg router\n:28765]
+    CC[Claude Code] -->|ANTHROPIC_BASE_URL| R[shared clg router\n:28765]
     R -->|main chat + compaction\nclaude-opus-5 · OAuth| A[api.anthropic.com]
-    R -->|subagents: opus/fable→sol\nsonnet→terra · haiku→luna| P[claude-code-proxy\n:18765]
-    P --> X[ChatGPT Pro / Codex]
+    R -->|scheduled proxy requests| S[AIMD scheduler\npermits + retry]
+    S -->|opus/fable→sol\ninherited/sonnet→terra · haiku→luna| P1[proxy account A\n:18765]
+    S -->|most free capacity| P2[proxy account B\n:18766]
+    P1 --> X[ChatGPT Pro / Codex]
+    P2 --> X
 ```
 
 ## Model routing
@@ -26,12 +30,14 @@ flowchart LR
 | Subagents `opus` / `fable` | `gpt-5.6-sol` | proxy |
 | Subagents `sonnet` | `gpt-5.6-terra` | proxy |
 | Subagents `haiku` | `gpt-5.6-luna` | proxy |
-| Subagents with **no model** (inherited) — native *and* custom agents | `gpt-5.6-sol` | proxy |
+| Subagents with **no model** (inherited) — native *and* custom agents | `gpt-5.6-terra` | proxy |
 
-The per-account router tells the main thread apart from inherited-model subagents by the
+The router tells the main thread apart from inherited-model subagents by the
 request's system prompt (whitelist, fail-safe: anything unrecognized goes to GPT, never
-to your Anthropic quota). Every request is logged as a `route …` line in
-`~/.local/state/claude-code-proxy/clg-router-<account>.log`.
+to your Anthropic quota). Every request is logged as a `route …` line, including the
+chosen upstream and attempt number, in
+`~/.local/state/claude-code-proxy/clg-router-shared.log` by default or
+`clg-router-<account>.log` for an explicit account selector.
 
 The `[1m]` suffix matters: without it Claude Code clamps non-first-party auth to a 200k
 window and compacts constantly. Opus 5 is natively 1M and the API serves it over
@@ -55,16 +61,25 @@ git clone https://github.com/momomuchu/clg && cd clg
 ## Usage
 
 ```sh
-clg                    # single account, or round-robin if several
-clg @b                 # pin account "b"
+clg                    # shared router across every authenticated account
+clg @auto              # same shared-router behavior explicitly
+clg @b                 # pin account "b" for debugging
 clg @list              # accounts + proxy + router + Anthropic OAuth status
 clg-account add b      # add a ChatGPT Pro account (device-code login)
-clg-fleet -j 3 p1.txt p2.txt   # batch `clg -p` runs with retry on the Codex 403 cap
+clg-fleet -j 3 p1.txt p2.txt   # batch `clg -p` runs
 ```
 
-Each account gets its own proxy instance (isolated `CCP_CONFIG_DIR`) and its own
-router, so the Codex per-account concurrent-session cap is multiplied by the number
-of accounts.
+Each account gets its own proxy instance (isolated `CCP_CONFIG_DIR`). The default shared
+router listens on port `28765`, starts every authenticated account proxy, and picks the
+upstream with the most free capacity for each proxy-bound request. Each upstream starts
+with 6 permits. A WebSocket-upgrade 403 reduces that upstream's permits by 25% (floor 2)
+and is retried up to 4 total attempts, preferring another account. Every 20 consecutive
+successful responses adds one permit (ceiling 12). Main-chat Anthropic traffic bypasses
+this scheduler. An explicit `@name` keeps the original single-upstream router on
+`account port + 10000`.
+
+`GET /__clg` reports the configured upstream set plus each upstream's permits, in-flight
+count, free capacity, and current success streak.
 
 ## Caveats
 
