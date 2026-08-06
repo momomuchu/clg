@@ -24,15 +24,27 @@ REGISTRY = CFG_DIR / "accounts.json"
 PROXY_BIN = shutil.which("claude-code-proxy") or "/opt/homebrew/bin/claude-code-proxy"
 BASE_PORT = 18765
 DEFAULT_REGISTRY = {
-    "a": {"dir": str(HOME / ".config/claude-code-proxy"), "port": BASE_PORT, "brew": True},
+    "a": {"kind": "proxy", "dir": str(HOME / ".config/claude-code-proxy"), "port": BASE_PORT, "brew": True},
 }
 
 
 def load_registry() -> dict:
+    """Registre COMPLET, toutes surfaces confondues.
+
+    Il est partagé avec clgctl, qui y range aussi des comptes Claude Code et
+    Codex. Cette fonction alimente aussi les écritures : la filtrer sur les
+    comptes proxy ferait disparaître les autres surfaces à la première
+    sauvegarde. Le filtrage appartient au lecteur, jamais à l'écrivain.
+    """
     reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+    reg = {name: {**acc, "kind": acc.get("kind", "proxy")} for name, acc in reg.items()}
     for name, acc in DEFAULT_REGISTRY.items():
-        reg.setdefault(name, acc)
+        reg.setdefault(name, dict(acc))
     return reg
+
+
+def proxy_accounts(reg: dict) -> dict:
+    return {name: acc for name, acc in reg.items() if acc.get("kind", "proxy") == "proxy"}
 
 
 def save_registry(reg: dict) -> None:
@@ -41,18 +53,27 @@ def save_registry(reg: dict) -> None:
 
 
 def next_port(reg: dict) -> int:
-    return max(acc["port"] for acc in reg.values()) + 1
+    return max(acc["port"] for acc in proxy_accounts(reg).values()) + 1
 
 
 def cmd_add(name: str, browser: bool) -> int:
     if not name.replace("-", "").isalnum() or name in ("auto", "list", "status"):
         sys.exit(f"clg-account: nom invalide '{name}' (alphanumérique, pas 'auto'/'list'/'status')")
     reg = load_registry()
+    if name in reg and reg[name].get("kind", "proxy") != "proxy":
+        sys.exit(
+            f"clg-account: @{name} est déjà un compte {reg[name]['kind']} (clgctl). "
+            "Choisis un autre nom."
+        )
     if name in reg and (pathlib.Path(reg[name]["dir"]) / "codex" / "auth.json").exists():
         print(f"@{name} existe déjà et est authentifié. Pour re-loguer: clg-account remove {name} --purge puis add.")
         return 1
 
-    acc = reg.get(name) or {"dir": str(HOME / f".config/claude-code-proxy-{name}"), "port": next_port(reg)}
+    acc = reg.get(name) or {
+        "kind": "proxy",
+        "dir": str(HOME / f".config/claude-code-proxy-{name}"),
+        "port": next_port(reg),
+    }
     cfg_dir = pathlib.Path(acc["dir"])
     cfg_dir.mkdir(parents=True, exist_ok=True)
     config_json = cfg_dir / "config.json"
@@ -92,6 +113,8 @@ def cmd_remove(name: str, purge: bool) -> int:
     reg = load_registry()
     if name not in reg:
         sys.exit(f"clg-account: compte inconnu '@{name}'")
+    if reg[name].get("kind", "proxy") != "proxy":
+        sys.exit(f"clg-account: @{name} est un compte {reg[name]['kind']} — utilise `clgctl account remove {name}`.")
     if reg[name].get("brew"):
         sys.exit("clg-account: le compte par défaut @a (service brew) ne se retire pas d'ici.")
     acc = reg.pop(name)

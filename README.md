@@ -85,6 +85,52 @@ shared router remains the sole owner of permits and AIMD state.
 `GET /__clg` reports the configured upstream set plus each upstream's permits, in-flight
 count, free capacity, and current success streak.
 
+## Fleet: several Claude Code and Codex accounts
+
+`clgctl` manages three authentication surfaces from one registry
+(`~/.config/clg/accounts.json`). Each account lives in its own directory and is logged in
+**once**; the credentials stay there and are never asked for again.
+
+| Surface | Isolated by | Added with |
+|---|---|---|
+| `proxy` — a claude-code-proxy upstream | `CCP_CONFIG_DIR` | `clg-account add <name>` |
+| `claude` — a Claude Code config dir | `CLAUDE_CONFIG_DIR` | `clgctl account add --kind claude <name>` |
+| `codex` — a Codex CLI home | `CODEX_HOME` | `clgctl account add --kind codex <name>` |
+
+```sh
+clgctl status                      # auth + expiry across the whole fleet
+clgctl status --deep               # probe each account for real (slower)
+clgctl account add --kind claude pro1
+clgctl refresh --on all            # refresh tokens that are close to expiring
+clgctl run --on all -- codex login status
+```
+
+The canonical `~/.claude` and `~/.codex` accounts appear as `@main` and `@codex`. They are
+never stored in the registry, moved, or modified.
+
+Enrolment refuses to register an account whose login produced no credentials, and warns
+loudly if no new keychain entry appeared — that would mean the login overwrote the
+canonical account instead of creating its own store.
+
+### Model routing as configuration
+
+The tier map lives in `~/.config/clg/fleet/gpt/routing.json`. While that file is absent or
+unreadable, the values compiled into `bin/clg` apply, so routing is unchanged until you
+choose to change it.
+
+```sh
+clgctl config show                            # effective routing
+clgctl config diff                            # what differs from the built-in defaults
+clgctl config set tiers.haiku=gpt-5.6-terra   # fleet-wide
+clgctl config set tiers.haiku=gpt-5.6-sol --account b   # this account only
+clgctl config unset tiers.haiku --account b   # back to the default
+clgctl config apply --dry-run                 # print, write nothing
+```
+
+Per-account overrides resolve at launch, in the environment handed to Claude Code — the
+shared router serves several accounts over one socket and cannot attribute a request to
+one. The router keeps translating aliases (`opus`, `fable`) with the base tiers.
+
 ## Caveats
 
 - If the Claude OAuth token expires (long stretches without a normal `claude` session),

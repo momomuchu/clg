@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+"""clgctl — gestionnaire de flotte multi-comptes (Claude Code · Codex · proxy GPT).
+
+Un seul registre décrit trois surfaces d'authentification :
+
+  kind=proxy   un upstream claude-code-proxy      isolé par CCP_CONFIG_DIR   (géré par clg-account)
+  kind=claude  un dossier de config Claude Code   isolé par CLAUDE_CONFIG_DIR
+  kind=codex   un home Codex CLI                  isolé par CODEX_HOME
+
+Chaque compte se logue UNE fois dans son dossier isolé ; l'authentification y
+reste et n'est plus jamais redemandée. clgctl expose l'état de toute la flotte,
+rafraîchit les jetons, exécute une commande sur un ou tous les comptes, et
+propage le routage des modèles GPT.
+
+Usage:
+  clgctl status [--deep]
+  clgctl account list
+  clgctl account add --kind claude|codex <nom>
+  clgctl account remove <nom> [--purge]
+  clgctl refresh [--on all|@nom] [--deep]
+  clgctl run [--on all|@nom] [-j N] -- <commande...>
+  clgctl config show|diff|set|unset|apply [...]
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+HOME = pathlib.Path.home()
+CFG_DIR = HOME / ".config" / "clg"
+REGISTRY = CFG_DIR / "accounts.json"
+FLEET_DIR = CFG_DIR / "fleet"
+ROUTING_FILE = FLEET_DIR / "gpt" / "routing.json"
+
+CLAUDE_ACCOUNTS_DIR = HOME / ".claude-accounts"
+CODEX_ACCOUNTS_DIR = HOME / ".codex-accounts"
+CANONICAL_CLAUDE_HOME = HOME / ".claude"
+CANONICAL_CODEX_HOME = HOME / ".codex"
+
+KINDS = ("proxy", "claude", "codex")
+RESERVED_NAMES = {"all", "auto", "list", "status", "add", "remove", "run", "config", "refresh"}
+
+PROXY_BIN = shutil.which("claude-code-proxy") or "/opt/homebrew/bin/claude-code-proxy"
+BASE_PORT = 18765
+
+# Le compte proxy par défaut, identique à celui de clg/clg-account : le registre
+# reste lisible par les trois outils.
+DEFAULT_REGISTRY = {
+    "a": {"kind": "proxy", "dir": str(HOME / ".config/claude-code-proxy"), "port": BASE_PORT, "brew": True},
+}
+
+# Valeurs actuellement codées en dur dans bin/clg. Elles restent le défaut : tant
+# que routing.json est absent, le comportement est strictement inchangé.
+DEFAULT_ROUTING = {
+    "main_model": "claude-opus-5",
+    "main_model_env": "claude-opus-5[1m]",
+    "tiers": {
+        "opus": "gpt-5.6-sol",
+        "sonnet": "gpt-5.6-terra",
+        "haiku": "gpt-5.6-luna",
+        "inherited": "gpt-5.6-terra",
+    },
+    "overrides": {},
+}
+TIER_KEYS = tuple(DEFAULT_ROUTING["tiers"])
+
+REFRESH_MARGIN_SECONDS = 30 * 60
+
+
+# ---------------------------------------------------------------------------
+# Registre
+# ---------------------------------------------------------------------------
+
+def normalize(reg: dict) -> dict:
+    """Une entrée sans `kind` date d'avant les comptes Claude/Codex : c'est un proxy."""
+    out = {}
+    for name, acc in reg.items():
+        acc = dict(acc)
+        acc.setdefault("kind", "proxy")
+        out[name] = acc
+    return out
+
+
+def load_registry() -> dict:
+    """Registre COMPLET, toutes surfaces. Toute écriture doit repartir d'ici,
+    sinon sauvegarder une vue filtrée effacerait les autres surfaces."""
+    reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+    reg = normalize(reg)
+    for name, acc in DEFAULT_REGISTRY.items():
+        reg.setdefault(name, dict(acc))
+    return reg
+
+
+def save_registry(reg: dict) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(normalize(reg), indent=2, sort_keys=True) + "\n"
+    tmp = REGISTRY.with_suffix(".json.tmp")
+    tmp.write_text(payload)
+    tmp.replace(REGISTRY)
+
+
+def accounts_of(reg: dict, kind: str) -> dict:
+    return {name: acc for name, acc in reg.items() if acc.get("kind", "proxy") == kind}
+
+
+def account_home(acc: dict) -> pathlib.Path:
+    return pathlib.Path(acc["home"]).expanduser()
+
+
+def resolve_selector(reg: dict, selector: str | None) -> dict:
+    """`None`/`all` -> toute la flotte ; `@nom`/`nom` -> ce compte seul."""
+    fleet = dict(reg)
+    for name, acc in implicit_accounts().items():
+        fleet.setdefault(name, acc)
+    if not selector or selector == "all":
+        return fleet
+    name = selector.lstrip("@")
+    if name not in fleet:
+        sys.exit(
+            f"clgctl: compte inconnu '@{name}'. Connus : "
+            + ", ".join("@" + n for n in sorted(fleet))
+        )
+    return {name: fleet[name]}
+
+
+def implicit_accounts() -> dict:
+    """Les comptes canoniques ne sont jamais écrits dans le registre : ils sont
+    déjà là, on les affiche sans jamais les déplacer ni les modifier."""
+    out = {}
+    if CANONICAL_CLAUDE_HOME.exists():
+        out["main"] = {"kind": "claude", "home": str(CANONICAL_CLAUDE_HOME), "canonical": True}
+    if CANONICAL_CODEX_HOME.exists():
+        out["codex"] = {"kind": "codex", "home": str(CANONICAL_CODEX_HOME), "canonical": True}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Claude Code : identité, trousseau, état
+# ---------------------------------------------------------------------------
+
+def claude_identity_file(home: pathlib.Path) -> pathlib.Path:
+    """Sans CLAUDE_CONFIG_DIR, Claude Code écrit ~/.claude.json À CÔTÉ de ~/.claude ;
+    avec, il l'écrit DANS le dossier. Vérifié sur 2.1.222."""
+    if home == CANONICAL_CLAUDE_HOME:
+        return HOME / ".claude.json"
+    return home / ".claude.json"
+
+
+def keychain_services(home: pathlib.Path) -> list[str]:
+    """Noms de service candidats, par ordre de préférence.
+
+    Formule lue dans le binaire 2.1.222 :
+        service = "Claude Code" + OAUTH_FILE_SUFFIX + "-credentials" + suffixe
+        suffixe = ""  si CLAUDE_CONFIG_DIR est absent (compte canonique)
+                = "-" + sha256(<config dir>)[:8]  sinon
+    Le chemin haché est le chemin résolu : /tmp est un lien vers /private/tmp,
+    d'où les deux candidats. Le service réellement utilisé est de toute façon
+    constaté par diff du trousseau à l'enrôlement et mémorisé dans le registre.
+    """
+    if home == CANONICAL_CLAUDE_HOME:
+        return ["Claude Code-credentials"]
+    candidates = []
+    for path in dict.fromkeys([str(home), os.path.realpath(home)]):
+        digest = hashlib.sha256(path.encode()).hexdigest()[:8]
+        candidates.append(f"Claude Code-credentials-{digest}")
+    return candidates
+
+
+def keychain_service_names() -> set[str]:
+    try:
+        out = subprocess.run(
+            ["security", "dump-keychain"], capture_output=True, text=True, timeout=30
+        ).stdout
+    except Exception:
+        return set()
+    return {
+        line.split('="', 1)[1].rstrip('"')
+        for line in out.splitlines()
+        if '"svce"<blob>="Claude Code' in line
+    }
+
+
+def read_keychain(service: str) -> dict:
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return json.loads(out.stdout.strip()).get("claudeAiOauth") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def claude_oauth(acc: dict) -> tuple[dict, str | None]:
+    """Retourne (oauth, service). Le trousseau prime sur .credentials.json : le
+    fichier peut annoncer un jeton expiré depuis des semaines alors que le
+    trousseau est à jour — c'est l'ordre retenu par bin/clg:read_oauth."""
+    home = account_home(acc)
+    for service in [acc["keychain"]] if acc.get("keychain") else keychain_services(home):
+        data = read_keychain(service)
+        if data:
+            return data, service
+    try:
+        data = json.loads((home / ".credentials.json").read_text())
+        return data.get("claudeAiOauth") or {}, None
+    except Exception:
+        return {}, None
+
+
+def claude_state(acc: dict, deep: bool = False) -> dict:
+    home = account_home(acc)
+    oauth, service = claude_oauth(acc)
+    state = {
+        "home": str(home),
+        "email": None,
+        "plan": oauth.get("subscriptionType"),
+        "expires_at": oauth.get("expiresAt", 0) / 1000 or None,
+        "keychain": service,
+        "enrolled": False,
+        "detail": "",
+    }
+    try:
+        data = json.loads(claude_identity_file(home).read_text())
+        account = data.get("oauthAccount") or {}
+        state["email"] = account.get("emailAddress")
+        state["enrolled"] = bool(state["email"])
+    except Exception:
+        pass
+    if not state["enrolled"]:
+        state["detail"] = "jamais logué dans ce dossier"
+    if deep:
+        state["detail"] = claude_liveness(home)
+    return state
+
+
+def claude_liveness(home: pathlib.Path) -> str:
+    """Le seul oracle fiable : `claude auth status` ignore CLAUDE_CONFIG_DIR et
+    répond loggedIn=true même dans un dossier vierge. Un vrai tour headless, lui,
+    répond « Not logged in »."""
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(home))
+    for var in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY"):
+        env.pop(var, None)
+    try:
+        out = subprocess.run(
+            [resolve_claude_bin(), "-p", "ping"],
+            capture_output=True, text=True, timeout=90, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return "sonde: délai dépassé"
+    except Exception as exc:  # binaire introuvable
+        return f"sonde impossible: {exc}"
+    text = (out.stdout + out.stderr).strip()
+    if "Not logged in" in text:
+        return "sonde: NON authentifié"
+    return "sonde: authentifié" if out.returncode == 0 else f"sonde: rc={out.returncode}"
+
+
+def resolve_claude_bin() -> str:
+    override = os.environ.get("CLG_CLAUDE_BIN_OVERRIDE")
+    candidates = [override] if override else []
+    which = shutil.which("claude")
+    if which:
+        candidates.append(which)
+    candidates += [str(HOME / ".local/bin/claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+    for candidate in candidates:
+        if candidate and os.access(candidate, os.X_OK):
+            return os.path.realpath(candidate)
+    sys.exit("clgctl: Claude Code est introuvable. Définissez CLG_CLAUDE_BIN_OVERRIDE.")
+
+
+# ---------------------------------------------------------------------------
+# Codex
+# ---------------------------------------------------------------------------
+
+def jwt_expiry(token: str) -> float | None:
+    """`exp` du payload JWT, sans vérification de signature : on ne fait que lire
+    une date, jamais accorder une confiance."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:
+        return None
+
+
+def codex_state(acc: dict, deep: bool = False) -> dict:
+    home = account_home(acc)
+    state = {"home": str(home), "email": None, "plan": None,
+             "expires_at": None, "enrolled": False, "detail": ""}
+    try:
+        data = json.loads((home / "auth.json").read_text())
+    except Exception:
+        state["detail"] = "jamais logué dans ce home"
+        return state
+    tokens = data.get("tokens") or {}
+    state["enrolled"] = bool(tokens.get("access_token") or data.get("OPENAI_API_KEY"))
+    state["plan"] = data.get("auth_mode") or ("api-key" if data.get("OPENAI_API_KEY") else None)
+    # C'est access_token qui porte la validité de la session. id_token est un
+    # jeton d'IDENTITÉ : il expire en quelques heures et le reste, sans que le
+    # compte cesse de fonctionner. Le lire ferait afficher « EXPIRÉ » à un
+    # compte parfaitement valide.
+    state["expires_at"] = jwt_expiry(tokens.get("access_token") or "") or jwt_expiry(tokens.get("id_token") or "")
+    state["email"] = jwt_identity(tokens.get("id_token") or "") or jwt_identity(tokens.get("access_token") or "")
+    if data.get("last_refresh"):
+        state["detail"] = f"rafraîchi {data['last_refresh'][:10]}"
+    if deep:
+        state["detail"] = codex_liveness(home)
+    return state
+
+
+def jwt_identity(token: str) -> str | None:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
+    return claims.get("email") or claims.get("preferred_username")
+
+
+def codex_liveness(home: pathlib.Path) -> str:
+    try:
+        out = subprocess.run(
+            ["codex", "login", "status"], capture_output=True, text=True,
+            timeout=30, env=dict(os.environ, CODEX_HOME=str(home)),
+        )
+    except Exception as exc:
+        return f"sonde impossible: {exc}"
+    return "sonde: " + (out.stdout.strip().splitlines() or ["(vide)"])[0]
+
+
+# ---------------------------------------------------------------------------
+# Proxy (délégué à claude-code-proxy, comme bin/clg)
+# ---------------------------------------------------------------------------
+
+def proxy_state(acc: dict, deep: bool = False) -> dict:
+    directory = pathlib.Path(acc["dir"]).expanduser()
+    state = {"home": str(directory), "email": None, "plan": None,
+             "expires_at": None, "enrolled": (directory / "codex" / "auth.json").exists(),
+             "detail": f"port {acc.get('port', '?')}"}
+    if not state["enrolled"]:
+        state["detail"] += " · jamais logué (clg-account add)"
+    elif deep and os.access(PROXY_BIN, os.X_OK):
+        try:
+            out = subprocess.run(
+                [PROXY_BIN, "codex", "auth", "status"], capture_output=True, text=True,
+                timeout=30, env=dict(os.environ, CCP_CONFIG_DIR=str(directory)),
+            )
+            first = (out.stdout.strip().splitlines() or ["(vide)"])[0]
+            state["detail"] += f" · {first}"
+        except Exception as exc:
+            state["detail"] += f" · sonde impossible: {exc}"
+    return state
+
+
+STATE_READERS = {"claude": claude_state, "codex": codex_state, "proxy": proxy_state}
+
+
+# ---------------------------------------------------------------------------
+# Routage GPT
+# ---------------------------------------------------------------------------
+
+def validate_routing(cfg: object) -> dict:
+    """Refuse plutôt que de deviner : une config de routage à moitié valide
+    enverrait silencieusement le trafic sur un modèle inexistant."""
+    if not isinstance(cfg, dict):
+        raise ValueError("routing.json doit être un objet JSON")
+    out = {"main_model": cfg.get("main_model", DEFAULT_ROUTING["main_model"]),
+           "main_model_env": cfg.get("main_model_env", DEFAULT_ROUTING["main_model_env"]),
+           "tiers": dict(DEFAULT_ROUTING["tiers"]), "overrides": {}}
+    for key in ("main_model", "main_model_env"):
+        if not isinstance(out[key], str) or not out[key].strip():
+            raise ValueError(f"{key} doit être une chaîne non vide")
+    tiers = cfg.get("tiers", {})
+    if not isinstance(tiers, dict):
+        raise ValueError("tiers doit être un objet")
+    for tier, model in tiers.items():
+        if tier not in TIER_KEYS:
+            raise ValueError(f"tier inconnu '{tier}' (attendus : {', '.join(TIER_KEYS)})")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(f"tiers.{tier} doit être une chaîne non vide")
+        out["tiers"][tier] = model
+    overrides = cfg.get("overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("overrides doit être un objet")
+    for account, partial in overrides.items():
+        if not isinstance(partial, dict):
+            raise ValueError(f"overrides.{account} doit être un objet")
+        sub = {}
+        for tier, model in (partial.get("tiers") or {}).items():
+            if tier not in TIER_KEYS:
+                raise ValueError(f"overrides.{account}: tier inconnu '{tier}'")
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(f"overrides.{account}.tiers.{tier} doit être une chaîne non vide")
+            sub[tier] = model
+        out["overrides"][account.lstrip("@")] = {"tiers": sub}
+    return out
+
+
+def load_routing(account: str | None = None) -> dict:
+    """Config effective. Fichier absent ou illisible -> défauts codés en dur,
+    donc comportement identique à avant l'externalisation."""
+    cfg = dict(DEFAULT_ROUTING)
+    cfg["tiers"] = dict(DEFAULT_ROUTING["tiers"])
+    if ROUTING_FILE.exists():
+        cfg = validate_routing(json.loads(ROUTING_FILE.read_text()))
+    if account:
+        override = (cfg.get("overrides") or {}).get(account.lstrip("@"), {})
+        cfg = dict(cfg, tiers=dict(cfg["tiers"], **(override.get("tiers") or {})))
+    return cfg
+
+
+def write_routing(cfg: dict, dry_run: bool) -> bool:
+    cfg = validate_routing(cfg)
+    payload = json.dumps(cfg, indent=2, sort_keys=True) + "\n"
+    if dry_run:
+        print(payload, end="")
+        print(f"(--dry-run : rien écrit dans {ROUTING_FILE})")
+        return False
+    ROUTING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if ROUTING_FILE.exists():
+        backup = ROUTING_FILE.with_suffix(f".json.bak-{int(time.time())}")
+        shutil.copy2(ROUTING_FILE, backup)
+        print(f"sauvegarde : {backup}")
+    tmp = ROUTING_FILE.with_suffix(".json.tmp")
+    tmp.write_text(payload)
+    tmp.replace(ROUTING_FILE)
+    print(f"✓ écrit {ROUTING_FILE}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Environnement par compte
+# ---------------------------------------------------------------------------
+
+def account_env(acc: dict, base: dict | None = None) -> dict:
+    env = dict(base if base is not None else os.environ)
+    kind = acc.get("kind", "proxy")
+    if kind == "claude":
+        env["CLAUDE_CONFIG_DIR"] = str(account_home(acc))
+    elif kind == "codex":
+        env["CODEX_HOME"] = str(account_home(acc))
+    else:
+        env["CCP_CONFIG_DIR"] = str(pathlib.Path(acc["dir"]).expanduser())
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Commandes
+# ---------------------------------------------------------------------------
+
+def humanize(expires_at: float | None) -> str:
+    if not expires_at:
+        return "—"
+    delta = (expires_at - time.time()) / 3600
+    if delta < 0:
+        return f"EXPIRÉ ({abs(delta):.0f} h)"
+    return f"{delta:.1f} h"
+
+
+def cmd_status(args) -> int:
+    reg = load_registry()
+    fleet = resolve_selector(reg, args.on)
+    rows = []
+    for name in sorted(fleet):
+        acc = fleet[name]
+        kind = acc.get("kind", "proxy")
+        state = STATE_READERS[kind](acc, deep=args.deep)
+        rows.append((name, kind, state))
+    width = max((len(name) for name, _, _ in rows), default=4) + 1
+    print(f"{'COMPTE'.ljust(width)} {'SURFACE':7} {'AUTH':5} {'EXPIRE':>12}  IDENTITÉ / DÉTAIL")
+    for name, kind, state in rows:
+        flag = "oui" if state["enrolled"] else "NON"
+        identity = state.get("email") or ""
+        plan = f" [{state['plan']}]" if state.get("plan") else ""
+        detail = state.get("detail") or ""
+        tail = " · ".join(part for part in (identity + plan, detail) if part.strip())
+        print(f"{name.ljust(width)} {kind:7} {flag:5} {humanize(state['expires_at']):>12}  {tail}")
+    if not args.deep:
+        print("\n(--deep sonde réellement chaque compte ; sans lui l'état vient des fichiers locaux)")
+    return 0
+
+
+def cmd_account_list(args) -> int:
+    reg = load_registry()
+    fleet = resolve_selector(reg, None)
+    for name in sorted(fleet):
+        acc = fleet[name]
+        location = acc.get("home") or acc.get("dir")
+        mark = " (canonique, non modifiable)" if acc.get("canonical") else ""
+        print(f"@{name}\t{acc.get('kind', 'proxy')}\t{location}{mark}")
+    return 0
+
+
+def cmd_account_add(args) -> int:
+    name, kind = args.name, args.kind
+    if kind == "proxy":
+        return subprocess.run(["clg-account", "add", name] + (["--browser"] if args.browser else [])).returncode
+    if not name.replace("-", "").isalnum() or name in RESERVED_NAMES:
+        sys.exit(f"clgctl: nom invalide '{name}' (alphanumérique, et pas {sorted(RESERVED_NAMES)})")
+
+    reg = load_registry()
+    if name in reg or name in implicit_accounts():
+        sys.exit(f"clgctl: @{name} existe déjà. `clgctl account remove {name}` d'abord.")
+
+    home = (CLAUDE_ACCOUNTS_DIR if kind == "claude" else CODEX_ACCOUNTS_DIR) / name
+    home.mkdir(parents=True, exist_ok=True)
+    acc = {"kind": kind, "home": str(home)}
+
+    before = keychain_service_names() if kind == "claude" else set()
+    print(f"→ Login {kind} du compte @{name} dans {home}")
+    print("  Connecte-toi au BON compte : ce dossier est isolé, rien n'est partagé avec les autres.")
+
+    if kind == "claude":
+        rc = subprocess.run([resolve_claude_bin(), "auth", "login"], env=account_env(acc)).returncode
+    else:
+        rc = subprocess.run(["codex", "login"], env=account_env(acc)).returncode
+    if rc != 0:
+        sys.exit(f"clgctl: login échoué (rc={rc}). @{name} n'est PAS enregistré.")
+
+    state = STATE_READERS[kind](acc)
+    if not state["enrolled"]:
+        sys.exit(
+            f"clgctl: login terminé mais aucune authentification trouvée dans {home}.\n"
+            f"clgctl: @{name} n'est PAS enregistré (sinon il retomberait en silence sur le compte par défaut)."
+        )
+
+    if kind == "claude":
+        after = keychain_service_names()
+        new = sorted(after - before)
+        if len(new) == 1:
+            acc["keychain"] = new[0]
+            print(f"  trousseau dédié : {new[0]}")
+        elif not new:
+            print(
+                "  ATTENTION : aucune nouvelle entrée de trousseau n'est apparue.\n"
+                "  Ce login a probablement ÉCRASÉ les identifiants du compte canonique.\n"
+                f"  Vérifie `clgctl status --deep` avant de continuer (attendu : suffixe {keychain_services(home)[0]}).",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  entrées de trousseau nouvelles : {', '.join(new)} (aucune retenue, ambigu)")
+        others = {n: a for n, a in {**reg, **implicit_accounts()}.items() if a.get("kind") == "claude"}
+        for other_name, other in others.items():
+            if STATE_READERS["claude"](other).get("email") == state["email"]:
+                print(
+                    f"  ATTENTION : même identité que @{other_name} ({state['email']}).",
+                    file=sys.stderr,
+                )
+
+    reg[name] = acc
+    save_registry(reg)
+    print(f"✓ @{name} enregistré · {state.get('email') or 'identité non exposée'}")
+    return 0
+
+
+def cmd_account_remove(args) -> int:
+    reg = load_registry()
+    if args.name in implicit_accounts() and args.name not in reg:
+        sys.exit(f"clgctl: @{args.name} est un compte canonique : il n'est ni déplacé ni supprimé par cet outil.")
+    if args.name not in reg:
+        sys.exit(f"clgctl: compte inconnu '@{args.name}'")
+    acc = reg[args.name]
+    if acc.get("kind") == "proxy":
+        return subprocess.run(
+            ["clg-account", "remove", args.name] + (["--purge"] if args.purge else [])
+        ).returncode
+    reg.pop(args.name)
+    save_registry(reg)
+    if args.purge:
+        shutil.rmtree(account_home(acc), ignore_errors=True)
+    print(f"✓ @{args.name} retiré" + (" (auth effacée)" if args.purge else f" (auth conservée dans {acc['home']})"))
+    return 0
+
+
+def cmd_refresh(args) -> int:
+    """Rafraîchit les jetons proches de l'expiration, et VÉRIFIE que la date a
+    bougé : un rafraîchissement qu'on ne peut pas observer n'en est pas un."""
+    reg = load_registry()
+    fleet = resolve_selector(reg, args.on)
+    failures = 0
+    for name in sorted(fleet):
+        acc = fleet[name]
+        kind = acc.get("kind", "proxy")
+        before = STATE_READERS[kind](acc)
+        if not before["enrolled"]:
+            print(f"@{name}: non enrôlé, ignoré")
+            continue
+        expires = before["expires_at"]
+        if expires and expires - time.time() > REFRESH_MARGIN_SECONDS and not args.force:
+            print(f"@{name}: encore valide {humanize(expires)}, rien à faire")
+            continue
+        detail = STATE_READERS[kind](acc, deep=True)["detail"]
+        after = STATE_READERS[kind](acc)
+        moved = (after["expires_at"] or 0) > (expires or 0)
+        verdict = "rafraîchi" if moved else "INCHANGÉ"
+        if not moved:
+            failures += 1
+        print(f"@{name}: {verdict} · {humanize(after['expires_at'])} · {detail}")
+    if failures:
+        print(
+            f"\n{failures} compte(s) non rafraîchi(s). Un jeton expiré demande un vrai login : "
+            "`clgctl account add` pour un nouveau compte, ou relance l'outil concerné une fois.",
+            file=sys.stderr,
+        )
+    return 1 if failures else 0
+
+
+def cmd_run(args) -> int:
+    if not args.command:
+        sys.exit("clgctl run: passe la commande après `--`, ex: clgctl run --on all -- codex login status")
+    reg = load_registry()
+    fleet = resolve_selector(reg, args.on)
+    results: dict[str, int] = {}
+    lock = threading.Lock()
+    work: "queue.Queue[str]" = queue.Queue()
+    for name in sorted(fleet):
+        work.put(name)
+
+    def worker() -> None:
+        while True:
+            try:
+                name = work.get_nowait()
+            except queue.Empty:
+                return
+            acc = fleet[name]
+            out = subprocess.run(
+                args.command, capture_output=True, text=True, env=account_env(acc),
+            )
+            with lock:
+                results[name] = out.returncode
+                for line in (out.stdout + out.stderr).rstrip().splitlines() or ["(aucune sortie)"]:
+                    print(f"[@{name}] {line}")
+            work.task_done()
+
+    threads = [threading.Thread(target=worker) for _ in range(max(1, min(args.jobs, len(fleet))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    failed = [name for name, rc in results.items() if rc != 0]
+    if failed:
+        print(f"\néchecs : {', '.join('@' + name for name in failed)}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def cmd_config(args) -> int:
+    if args.action == "show":
+        print(json.dumps(load_routing(args.account), indent=2, sort_keys=True))
+        return 0
+    if args.action == "diff":
+        current = load_routing()
+        base = DEFAULT_ROUTING
+        changed = False
+        for key in ("main_model", "main_model_env"):
+            if current[key] != base[key]:
+                print(f"  {key}: {base[key]} -> {current[key]}")
+                changed = True
+        for tier in TIER_KEYS:
+            if current["tiers"][tier] != base["tiers"][tier]:
+                print(f"  tiers.{tier}: {base['tiers'][tier]} -> {current['tiers'][tier]}")
+                changed = True
+        for account, override in (current.get("overrides") or {}).items():
+            for tier, model in (override.get("tiers") or {}).items():
+                print(f"  @{account} tiers.{tier}: {current['tiers'][tier]} -> {model}")
+                changed = True
+        source = ROUTING_FILE if ROUTING_FILE.exists() else "(défauts codés en dur)"
+        print(f"aucun écart avec les défauts · source : {source}" if not changed else f"source : {source}")
+        return 0
+    if args.action == "apply":
+        write_routing(load_routing(), args.dry_run)
+        return 0
+    if args.action == "set":
+        cfg = load_routing()
+        cfg = dict(cfg, tiers=dict(cfg["tiers"]), overrides=dict(cfg.get("overrides") or {}))
+        key, _, value = args.assignment.partition("=")
+        if not value:
+            sys.exit("clgctl config set: attendu clé=valeur, ex: tiers.haiku=gpt-5.6-terra")
+        if args.account:
+            account = args.account.lstrip("@")
+            if not key.startswith("tiers."):
+                sys.exit("clgctl config set --account: seules les clés tiers.* sont surchargeables par compte")
+            override = dict(cfg["overrides"].get(account) or {"tiers": {}})
+            override["tiers"] = dict(override.get("tiers") or {}, **{key.split(".", 1)[1]: value})
+            cfg["overrides"][account] = override
+        elif key.startswith("tiers."):
+            cfg["tiers"][key.split(".", 1)[1]] = value
+        elif key in ("main_model", "main_model_env"):
+            cfg[key] = value
+        else:
+            sys.exit(f"clgctl config set: clé inconnue '{key}'")
+        write_routing(cfg, args.dry_run)
+        return 0
+    if args.action == "unset":
+        cfg = load_routing()
+        cfg = dict(cfg, tiers=dict(cfg["tiers"]), overrides=dict(cfg.get("overrides") or {}))
+        key = (args.assignment or "").partition("=")[0]
+        if not key:
+            sys.exit("clgctl config unset: attendu une clé, ex: tiers.haiku")
+        if args.account:
+            account = args.account.lstrip("@")
+            override = dict(cfg["overrides"].get(account) or {})
+            tiers = dict(override.get("tiers") or {})
+            tiers.pop(key.split(".", 1)[-1], None)
+            if tiers:
+                cfg["overrides"][account] = {"tiers": tiers}
+            else:
+                cfg["overrides"].pop(account, None)
+        elif key.startswith("tiers."):
+            tier = key.split(".", 1)[1]
+            if tier not in TIER_KEYS:
+                sys.exit(f"clgctl config unset: tier inconnu '{tier}'")
+            cfg["tiers"][tier] = DEFAULT_ROUTING["tiers"][tier]
+        elif key in ("main_model", "main_model_env"):
+            cfg[key] = DEFAULT_ROUTING[key]
+        else:
+            sys.exit(f"clgctl config unset: clé inconnue '{key}'")
+        write_routing(cfg, args.dry_run)
+        return 0
+    sys.exit(f"clgctl config: action inconnue '{args.action}'")
+
+
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="clgctl", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    status = sub.add_parser("status", help="état d'authentification de toute la flotte")
+    status.add_argument("--on", help="all (défaut) ou @nom")
+    status.add_argument("--deep", action="store_true", help="sonde réellement chaque compte")
+    status.set_defaults(func=cmd_status)
+
+    account = sub.add_parser("account", help="gestion des comptes")
+    account_sub = account.add_subparsers(dest="action", required=True)
+    listing = account_sub.add_parser("list")
+    listing.set_defaults(func=cmd_account_list)
+    add = account_sub.add_parser("add")
+    add.add_argument("name")
+    add.add_argument("--kind", choices=KINDS, required=True)
+    add.add_argument("--browser", action="store_true", help="proxy : login navigateur au lieu du device-code")
+    add.set_defaults(func=cmd_account_add)
+    remove = account_sub.add_parser("remove")
+    remove.add_argument("name")
+    remove.add_argument("--purge", action="store_true", help="efface aussi le dossier d'authentification")
+    remove.set_defaults(func=cmd_account_remove)
+
+    refresh = sub.add_parser("refresh", help="rafraîchit les jetons proches d'expirer")
+    refresh.add_argument("--on", help="all (défaut) ou @nom")
+    refresh.add_argument("--force", action="store_true", help="même si le jeton est encore large")
+    refresh.set_defaults(func=cmd_refresh)
+
+    run = sub.add_parser("run", help="exécute une commande sur un ou tous les comptes")
+    run.add_argument("--on", help="all (défaut) ou @nom")
+    run.add_argument("-j", "--jobs", type=int, default=3)
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    run.set_defaults(func=cmd_run)
+
+    config = sub.add_parser("config", help="routage des modèles GPT propagé à toute la flotte")
+    config.add_argument("action", choices=("show", "diff", "set", "unset", "apply"))
+    config.add_argument("assignment", nargs="?", help="clé=valeur pour `set`, clé pour `unset`")
+    config.add_argument("--account", help="surcharge propre à un compte (clés tiers.* uniquement)")
+    config.add_argument("--dry-run", action="store_true")
+    config.set_defaults(func=cmd_config)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if getattr(args, "command", None) and args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    try:
+        return args.func(args)
+    except ValueError as exc:
+        sys.exit(f"clgctl: {exc}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
