@@ -171,6 +171,72 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(all(status == 200 for status, _body in results))
         self.assertLessEqual(CappedStub.max_inflight, 3)
 
+    def test_generation_classifier_uses_path_component_only(self) -> None:
+        handler = object.__new__(clg.RouterHandler)
+        handler.command = "POST"
+        handler.path = "/v1/messages?beta=true"
+        self.assertTrue(handler._is_generation_request())
+
+        handler.path = "/v1/messages"
+        self.assertTrue(handler._is_generation_request())
+
+        handler.command = "GET"
+        handler.path = "/v1/models"
+        self.assertFalse(handler._is_generation_request())
+
+    def test_query_generation_websocket_403_retries_and_preserves_upstream_path(self) -> None:
+        class Response:
+            def __init__(self, status: int, body: bytes) -> None:
+                self.status = status
+                self.body = body
+
+            def getheader(self, name: str) -> str | None:
+                return str(len(self.body)) if name == "Content-Length" else None
+
+            def getheaders(self) -> list[tuple[str, str]]:
+                return [("Content-Length", str(len(self.body)))]
+
+            def read(self, _amount: int | None = None) -> bytes:
+                body, self.body = self.body, b""
+                return body
+
+            def read1(self, _amount: int) -> bytes:
+                return self.read()
+
+        class RecordingConnection:
+            requests: list[tuple[str, str]] = []
+            attempts = 0
+
+            def __init__(self, _port: int) -> None:
+                type(self).attempts += 1
+                self.attempt = type(self).attempts
+
+            def request(self, method: str, path: str, **_kwargs: object) -> None:
+                type(self).requests.append((method, path))
+
+            def getresponse(self) -> Response:
+                if self.attempt == 1:
+                    return Response(403, b"WebSocket upgrade was rejected")
+                return Response(200, b"retried-query-request")
+
+            def close(self) -> None:
+                pass
+
+        clock = FakeMonotonicClock()
+        with RunningRouter(
+            [{"name": "a", "port": 1}],
+            proxy_connection_factory=RecordingConnection,
+            retry_sleeper=lambda _delay: clock.advance(clg.COOLDOWN_SECONDS),
+            monotonic_clock=clock,
+        ) as router:
+            status, body = request(router.port, proxy_payload(), "/v1/messages?beta=true")
+
+        self.assertEqual((status, body), (200, b"retried-query-request"))
+        self.assertEqual(RecordingConnection.requests, [
+            ("POST", "/v1/messages?beta=true"),
+            ("POST", "/v1/messages?beta=true"),
+        ])
+
     def test_websocket_403_retries_on_same_upstream_after_backoff(self) -> None:
         class TransientRejectingStub(QuietHandler):
             requests = 0

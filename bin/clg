@@ -443,7 +443,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         self._downstream_committed = False
 
     def _relay(self) -> None:
-        if self.path == "/__clg":
+        if self.path.split("?", 1)[0] == "/__clg":
             upstreams = self.server.scheduler.snapshot()
             payload = json.dumps(
                 {
@@ -579,7 +579,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _is_generation_request(self) -> bool:
-        return self.command == "POST" and self.path == "/v1/messages"
+        return self.command == "POST" and self.path.split("?", 1)[0] == "/v1/messages"
 
     def _retry_delay(
         self,
