@@ -597,15 +597,24 @@ class RouterHandler(BaseHTTPRequestHandler):
             except UpstreamStreamError as exc:
                 if generation:
                     self.server.scheduler.failed(upstream)
-                if not self._downstream_committed:
+                if not self._downstream_committed and attempt < MAX_PROXY_ATTEMPTS:
+                    retry = True
+                    prefer_not_name = upstream.name if pinned_upstream is None else None
+                elif not self._downstream_committed:
                     self._error(502, f"clg-router: flux proxy @{upstream.name} tronqué: {exc}")
-                return
+            except (OSError, TimeoutError, http.client.HTTPException) as exc:
+                if generation:
+                    self.server.scheduler.failed(upstream)
+                if not self._downstream_committed and attempt < MAX_PROXY_ATTEMPTS:
+                    retry = True
+                    prefer_not_name = upstream.name if pinned_upstream is None else None
+                elif not self._downstream_committed:
+                    self._error(502, f"clg-router: upstream proxy @{upstream.name} injoignable: {exc}")
             except Exception as exc:
                 if generation:
                     self.server.scheduler.failed(upstream)
                 if not self._downstream_committed:
                     self._error(502, f"clg-router: upstream proxy @{upstream.name} injoignable: {exc}")
-                return
             finally:
                 try:
                     if conn is not None:

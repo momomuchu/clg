@@ -618,6 +618,129 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(router.server.scheduler.snapshot()[0]["successes"], 0)
             self.assertEqual(router.server.scheduler.snapshot()[0]["permits"], 1)
 
+    def test_uncommitted_stream_error_retries_then_returns_success(self) -> None:
+        # /v1/messages: a reset before response headers must transparently retry.
+        class SuccessResponse:
+            status = 200
+            def getheaders(self) -> list[tuple[str, str]]: return []
+            def read1(self, _size: int) -> bytes: return b""
+
+        class FirstStreamErrorThenSuccess:
+            attempts = 0
+
+            def __init__(self, _port: int) -> None:
+                type(self).attempts += 1
+                self.attempt = type(self).attempts
+
+            def request(self, *_args: object, **_kwargs: object) -> None:
+                if self.attempt == 1:
+                    raise clg.UpstreamStreamError("connection reset")
+
+            def getresponse(self) -> SuccessResponse:
+                return SuccessResponse()
+
+            def close(self) -> None: pass
+
+        delays: list[float] = []
+        with RunningRouter(
+            [{"name": "a", "port": 1}],
+            proxy_connection_factory=FirstStreamErrorThenSuccess,
+            retry_sleeper=delays.append,
+        ) as router:
+            status, body = request(router.port, proxy_payload())
+
+        self.assertEqual((status, body), (200, b""))
+        self.assertEqual(FirstStreamErrorThenSuccess.attempts, 2)
+        self.assertEqual(delays, [clg.RETRY_BASE_SECONDS])
+
+    def test_uncommitted_connection_error_retries_then_returns_success(self) -> None:
+        class SuccessResponse:
+            status = 200
+            def getheaders(self) -> list[tuple[str, str]]: return []
+            def read1(self, _size: int) -> bytes: return b""
+
+        class FirstConnectionErrorThenSuccess:
+            attempts = 0
+
+            def __init__(self, _port: int) -> None:
+                type(self).attempts += 1
+                self.attempt = type(self).attempts
+
+            def request(self, *_args: object, **_kwargs: object) -> None:
+                if self.attempt == 1:
+                    raise ConnectionResetError("connection reset")
+
+            def getresponse(self) -> SuccessResponse:
+                return SuccessResponse()
+
+            def close(self) -> None: pass
+
+        delays: list[float] = []
+        with RunningRouter(
+            [{"name": "a", "port": 1}],
+            proxy_connection_factory=FirstConnectionErrorThenSuccess,
+            retry_sleeper=delays.append,
+        ) as router:
+            status, body = request(router.port, proxy_payload())
+
+        self.assertEqual((status, body), (200, b""))
+        self.assertEqual(FirstConnectionErrorThenSuccess.attempts, 2)
+        self.assertEqual(delays, [clg.RETRY_BASE_SECONDS])
+
+    def test_committed_stream_error_is_not_retried(self) -> None:
+        # Negative control: after /v1/messages headers/body commit, retrying corrupts the response.
+        class PartialResponse:
+            status = 200
+            def getheaders(self) -> list[tuple[str, str]]: return []
+            def read1(self, _size: int) -> bytes:
+                raise ConnectionResetError("connection reset")
+
+        class AlwaysStreamError:
+            attempts = 0
+
+            def __init__(self, _port: int) -> None:
+                type(self).attempts += 1
+
+            def request(self, *_args: object, **_kwargs: object) -> None: pass
+            def getresponse(self) -> PartialResponse: return PartialResponse()
+            def close(self) -> None: pass
+
+        delays: list[float] = []
+        with RunningRouter(
+            [{"name": "a", "port": 1}],
+            proxy_connection_factory=AlwaysStreamError,
+            retry_sleeper=delays.append,
+        ) as router:
+            status, body = request(router.port, proxy_payload())
+
+        self.assertEqual((status, body), (200, b""))
+        self.assertEqual(AlwaysStreamError.attempts, 1)
+        self.assertEqual(delays, [])
+
+    def test_persistent_uncommitted_stream_errors_exhaust_retry_budget(self) -> None:
+        class AlwaysStreamError:
+            attempts = 0
+
+            def __init__(self, _port: int) -> None:
+                type(self).attempts += 1
+
+            def request(self, *_args: object, **_kwargs: object) -> None:
+                raise clg.UpstreamStreamError("connection reset")
+
+            def close(self) -> None: pass
+
+        delays: list[float] = []
+        with RunningRouter(
+            [{"name": "a", "port": 1}],
+            proxy_connection_factory=AlwaysStreamError,
+            retry_sleeper=delays.append,
+        ) as router:
+            status, _body = request(router.port, proxy_payload())
+
+        self.assertEqual(status, 502)
+        self.assertEqual(AlwaysStreamError.attempts, clg.MAX_PROXY_ATTEMPTS)
+        self.assertEqual(len(delays), clg.MAX_PROXY_ATTEMPTS - 1)
+
     def test_stream_truncation_and_client_disconnect_release_permit_without_aimd_success(self) -> None:
         class TruncatedResponse:
             status = 200
