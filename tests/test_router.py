@@ -204,7 +204,7 @@ class RouterTests(unittest.TestCase):
 
         self.assertEqual((status, body), (200, b"retried-same-upstream"))
         self.assertEqual(TransientRejectingStub.requests, 2)
-        self.assertEqual(delays, [clg.RETRY_BASE_SECONDS])
+        self.assertEqual(delays, [clg.RETRY_MAX_SLEEP_SECONDS])
 
     def test_websocket_retry_releases_permit_before_backoff(self) -> None:
         class TransientRejectingStub(QuietHandler):
@@ -598,7 +598,98 @@ class RouterTests(unittest.TestCase):
             ],
         )
 
-    def test_persistent_websocket_403_gives_up_after_retry_budget(self) -> None:
+    def test_websocket_403_waits_through_sixty_seconds_of_saturation(self) -> None:
+        class SaturatedThenHealthyStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if clock.now < 60.0:
+                    body = b"WebSocket upgrade was rejected"
+                    self.send_response(403)
+                else:
+                    body = b"recovered-after-saturation"
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        delays: list[float] = []
+        clock = FakeMonotonicClock()
+
+        def advance_time(delay: float) -> None:
+            delays.append(delay)
+            clock.advance(delay)
+
+        # Isolate the attempt-budget regression; cooldown cooperation has its own
+        # integration lock below.
+        original_cooldown = clg.COOLDOWN_SECONDS
+        clg.COOLDOWN_SECONDS = 0.0
+        try:
+            with StubServer(SaturatedThenHealthyStub) as upstream, RunningRouter(
+                [{"name": "a", "port": upstream.port}],
+                retry_sleeper=advance_time,
+                monotonic_clock=clock,
+            ) as router:
+                status, body = request(router.port, proxy_payload())
+        finally:
+            clg.COOLDOWN_SECONDS = original_cooldown
+
+        self.assertEqual((status, body), (200, b"recovered-after-saturation"))
+        self.assertGreater(SaturatedThenHealthyStub.requests, clg.MAX_PROXY_ATTEMPTS)
+        self.assertLess(clock.now, 180.0)
+        self.assertLess(len(delays), 10)
+        self.assertTrue(all(delay <= 15.0 for delay in delays))
+
+    def test_retry_waits_for_earliest_cooldown_when_all_upstreams_cool(self) -> None:
+        class RejectingStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"WebSocket upgrade was rejected"
+                self.send_response(403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        class SuccessStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"earliest-cooldown-won"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        clock = FakeMonotonicClock()
+        delays: list[float] = []
+
+        def advance_time(delay: float) -> None:
+            delays.append(delay)
+            clock.advance(delay)
+
+        with StubServer(RejectingStub) as first, StubServer(SuccessStub) as second, RunningRouter(
+            [{"name": "a", "port": first.port}, {"name": "b", "port": second.port}],
+            retry_sleeper=advance_time,
+            monotonic_clock=clock,
+        ) as router:
+            # The first selection is a. Its rejection cools it until t=20; b is
+            # already cooling until t=3, so retry must wait exactly for b, not .4s.
+            router.server.scheduler._upstreams[1].cooldown_until = 3.0
+            status, body = request(router.port, proxy_payload())
+
+        self.assertEqual((status, body), (200, b"earliest-cooldown-won"))
+        self.assertEqual(RejectingStub.requests, 1)
+        self.assertEqual(SuccessStub.requests, 1)
+        self.assertEqual(delays, [3.0])
+
+    def test_websocket_403_returns_once_after_wall_clock_budget(self) -> None:
         class RejectingStub(QuietHandler):
             requests = 0
 
@@ -611,24 +702,26 @@ class RouterTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
-        delays: list[float] = []
         clock = FakeMonotonicClock()
+        delays: list[float] = []
 
-        def advance_cooldown(delay: float) -> None:
+        def advance_time(delay: float) -> None:
             delays.append(delay)
-            clock.advance(clg.COOLDOWN_SECONDS)
+            clock.advance(delay)
 
         with StubServer(RejectingStub) as upstream, RunningRouter(
             [{"name": "a", "port": upstream.port}],
-            retry_sleeper=advance_cooldown,
+            retry_sleeper=advance_time,
             monotonic_clock=clock,
         ) as router:
             status, body = request(router.port, proxy_payload())
 
-        self.assertEqual(RejectingStub.requests, clg.MAX_PROXY_ATTEMPTS)
         self.assertEqual(status, 403)
-        self.assertEqual(body, f"WebSocket upgrade was rejected attempt-{clg.MAX_PROXY_ATTEMPTS}".encode())
-        self.assertEqual(len(delays), clg.MAX_PROXY_ATTEMPTS - 1)
+        self.assertEqual(body, f"WebSocket upgrade was rejected attempt-{RejectingStub.requests}".encode())
+        self.assertGreater(RejectingStub.requests, clg.MAX_PROXY_ATTEMPTS)
+        self.assertEqual(clock.now, 180.0)
+        self.assertTrue(all(delay <= 15.0 for delay in delays))
+        self.assertLess(len(delays), 25)
 
     def test_aimd_additive_increase_is_bounded(self) -> None:
         scheduler = clg.UpstreamScheduler([{"name": "a", "port": 1}], initial_permits=3)
@@ -904,7 +997,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(AlwaysStreamError.attempts, 1)
         self.assertEqual(delays, [])
 
-    def test_persistent_uncommitted_stream_errors_exhaust_retry_budget(self) -> None:
+    def test_persistent_uncommitted_stream_errors_exhaust_wall_clock_budget(self) -> None:
         class AlwaysStreamError:
             attempts = 0
 
@@ -916,17 +1009,25 @@ class RouterTests(unittest.TestCase):
 
             def close(self) -> None: pass
 
+        clock = FakeMonotonicClock()
         delays: list[float] = []
+
+        def advance_time(delay: float) -> None:
+            delays.append(delay)
+            clock.advance(delay)
+
         with RunningRouter(
             [{"name": "a", "port": 1}],
             proxy_connection_factory=AlwaysStreamError,
-            retry_sleeper=delays.append,
+            retry_sleeper=advance_time,
+            monotonic_clock=clock,
         ) as router:
             status, _body = request(router.port, proxy_payload())
 
         self.assertEqual(status, 502)
-        self.assertEqual(AlwaysStreamError.attempts, clg.MAX_PROXY_ATTEMPTS)
-        self.assertEqual(len(delays), clg.MAX_PROXY_ATTEMPTS - 1)
+        self.assertGreater(AlwaysStreamError.attempts, clg.MAX_PROXY_ATTEMPTS)
+        self.assertEqual(clock.now, 180.0)
+        self.assertTrue(all(delay <= 15.0 for delay in delays))
 
     def test_stream_truncation_and_client_disconnect_release_permit_without_aimd_success(self) -> None:
         class TruncatedResponse:

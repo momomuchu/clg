@@ -73,6 +73,8 @@ ACQUIRE_TIMEOUT_SECONDS = 300.0
 RETRY_BODY_LIMIT = 65536
 RETRY_BASE_SECONDS = 0.4
 RETRY_JITTER_SECONDS = 0.3
+RETRY_TOTAL_BUDGET_SECONDS = 180.0
+RETRY_MAX_SLEEP_SECONDS = 15.0
 COOLDOWN_SECONDS = 20.0
 # Défauts de routage. Ils restent la référence : tant que routing.json est absent
 # ou illisible, clg se comporte exactement comme avant son externalisation.
@@ -579,6 +581,68 @@ class RouterHandler(BaseHTTPRequestHandler):
     def _is_generation_request(self) -> bool:
         return self.command == "POST" and self.path == "/v1/messages"
 
+    def _retry_delay(
+        self,
+        attempt: int,
+        retry_started: float,
+        pinned_upstream: str | None,
+    ) -> float | None:
+        """Return a bounded wait while an uncommitted retry budget remains.
+
+        Saturated upstreams are cooled deliberately.  If no upstream can accept
+        work before the normal exponential backoff, wait for the earliest
+        cooldown expiry instead; retrying sooner only re-creates the rejected
+        WebSocket upgrade.  The injected monotonic clock and sleeper keep this
+        deterministic in tests.
+        """
+        now = self.server.scheduler._monotonic_clock()
+        remaining = RETRY_TOTAL_BUDGET_SECONDS - (now - retry_started)
+        if remaining <= 0:
+            return None
+        backoff = min(
+            RETRY_MAX_SLEEP_SECONDS,
+            RETRY_BASE_SECONDS * (2 ** min(attempt - 1, 6))
+            + self.server.jitter_source() * RETRY_JITTER_SECONDS,
+        )
+        cooldown_wait = self._earliest_cooldown_wait(now, pinned_upstream)
+        delay = max(backoff, cooldown_wait) if cooldown_wait is not None else backoff
+        return min(delay, RETRY_MAX_SLEEP_SECONDS, remaining)
+
+    def _earliest_cooldown_wait(self, now: float, only_name: str | None) -> float | None:
+        with self.server.scheduler._condition:
+            eligible = self.server.scheduler._eligible_upstreams(None, None, only_name)
+            cooldowns = [
+                upstream.cooldown_until - now
+                for upstream in eligible
+                if upstream.cooldown_until > now
+            ]
+            ready = any(
+                upstream.inflight < upstream.permits and upstream.cooldown_until <= now
+                for upstream in eligible
+            )
+        # Only use cooldown timing when *all* upstreams are cooling.  If one is
+        # available or merely capacity-constrained, ordinary backoff applies.
+        return min(cooldowns) if cooldowns and not ready else None
+
+    def _wait_for_retry(
+        self,
+        attempt: int,
+        retry_started: float,
+        pinned_upstream: str | None,
+    ) -> bool:
+        """Sleep in bounded chunks until retry capacity or budget exhaustion."""
+        while True:
+            delay = self._retry_delay(attempt, retry_started, pinned_upstream)
+            if delay is None:
+                return False
+            self.server.retry_sleeper(delay)
+            if self.server.scheduler._monotonic_clock() - retry_started >= RETRY_TOTAL_BUDGET_SECONDS:
+                return False
+            if self._earliest_cooldown_wait(
+                self.server.scheduler._monotonic_clock(), pinned_upstream
+            ) is None:
+                return True
+
     def _relay_proxy(
         self,
         body: bytes,
@@ -588,16 +652,29 @@ class RouterHandler(BaseHTTPRequestHandler):
     ) -> None:
         generation = self._is_generation_request()
         prefer_not_name = None
-        for attempt in range(1, MAX_PROXY_ATTEMPTS + 1):
+        retry_started = self.server.scheduler._monotonic_clock()
+        attempt = 0
+        while True:
+            attempt += 1
             try:
+                retry_remaining = RETRY_TOTAL_BUDGET_SECONDS - (
+                    self.server.scheduler._monotonic_clock() - retry_started
+                )
+                if generation and retry_remaining <= 0:
+                    self._error(503, "clg-router: capacité proxy indisponible: budget de retry épuisé")
+                    return
                 upstream = self.server.scheduler.acquire(
                     prefer_not_name=prefer_not_name,
                     only_name=pinned_upstream,
+                    timeout=min(ACQUIRE_TIMEOUT_SECONDS, retry_remaining),
                 ) if generation else self.server.scheduler.select_unlimited(pinned_upstream)
             except TimeoutError as exc:
                 self._error(503, f"clg-router: capacité proxy indisponible: {exc}")
                 return
             retry = False
+            retry_requires_wall_clock = False
+            retry_response: tuple[http.client.HTTPResponse, bytes] | None = None
+            retry_error: tuple[str, Exception] | None = None
             conn = None
             try:
                 conn = self.server.proxy_connection_factory(upstream.port)
@@ -615,11 +692,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                         rejected = len(buffered) <= RETRY_BODY_LIMIT and b"WebSocket upgrade" in buffered
                         if rejected and generation:
                             self.server.scheduler.websocket_rejected(upstream)
-                            if attempt < MAX_PROXY_ATTEMPTS:
-                                retry = True
-                                prefer_not_name = upstream.name if pinned_upstream is None else None
-                            else:
-                                self._send_response(response, buffered)
+                            retry = True
+                            retry_requires_wall_clock = True
+                            retry_response = (response, buffered)
+                            prefer_not_name = upstream.name if pinned_upstream is None else None
                         else:
                             self._send_response(response, buffered)
                             if generation:
@@ -634,16 +710,19 @@ class RouterHandler(BaseHTTPRequestHandler):
             except UpstreamStreamError as exc:
                 if generation:
                     self.server.scheduler.failed(upstream)
-                if not self._downstream_committed and attempt < MAX_PROXY_ATTEMPTS:
+                if not self._downstream_committed and generation:
                     retry = True
+                    retry_requires_wall_clock = True
+                    retry_error = ("flux proxy", exc)
                     prefer_not_name = upstream.name if pinned_upstream is None else None
                 elif not self._downstream_committed:
                     self._error(502, f"clg-router: flux proxy @{upstream.name} tronqué: {exc}")
             except (OSError, TimeoutError, http.client.HTTPException) as exc:
                 if generation:
                     self.server.scheduler.failed(upstream)
-                if not self._downstream_committed and attempt < MAX_PROXY_ATTEMPTS:
+                if not self._downstream_committed and generation and attempt < MAX_PROXY_ATTEMPTS:
                     retry = True
+                    retry_error = ("upstream proxy", exc)
                     prefer_not_name = upstream.name if pinned_upstream is None else None
                 elif not self._downstream_committed:
                     self._error(502, f"clg-router: upstream proxy @{upstream.name} injoignable: {exc}")
@@ -663,8 +742,24 @@ class RouterHandler(BaseHTTPRequestHandler):
                         self.server.scheduler.release(upstream)
             if not retry:
                 return
-            delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1)) + self.server.jitter_source() * RETRY_JITTER_SECONDS
-            self.server.retry_sleeper(delay)
+            if retry_requires_wall_clock:
+                if self._wait_for_retry(attempt, retry_started, pinned_upstream):
+                    continue
+            elif attempt < MAX_PROXY_ATTEMPTS:
+                delay = min(
+                    RETRY_MAX_SLEEP_SECONDS,
+                    RETRY_BASE_SECONDS * (2 ** min(attempt - 1, 6))
+                    + self.server.jitter_source() * RETRY_JITTER_SECONDS,
+                )
+                self.server.retry_sleeper(delay)
+                continue
+            if retry_response is not None:
+                response, buffered = retry_response
+                self._send_response(response, buffered)
+            elif retry_error is not None:
+                kind, exc = retry_error
+                self._error(502, f"clg-router: {kind} @{upstream.name} injoignable: {exc}")
+            return
 
     def _send_response(self, response: http.client.HTTPResponse, buffered: bytes = b"") -> bool:
         self.send_response(response.status)
