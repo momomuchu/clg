@@ -54,6 +54,17 @@ class StubServer:
         self.thread.join(timeout=2)
 
 
+class FakeMonotonicClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class RunningRouter:
     def __init__(
         self,
@@ -64,6 +75,7 @@ class RunningRouter:
         route_logger: object | None = None,
         proxy_connection_factory: object | None = None,
         retry_sleeper: object | None = None,
+        monotonic_clock: object | None = None,
     ) -> None:
         anthropic_factory = None
         if anthropic_port is not None:
@@ -79,6 +91,7 @@ class RunningRouter:
                 retry_sleeper if retry_sleeper is not None else lambda _delay: None
             ),
             jitter_source=lambda: 0.0,
+            monotonic_clock=monotonic_clock,
             route_logger=route_logger or (lambda _message: None),
             proxy_connection_factory=proxy_connection_factory,
         )
@@ -176,8 +189,16 @@ class RouterTests(unittest.TestCase):
                 self.wfile.write(body)
 
         delays: list[float] = []
+        clock = FakeMonotonicClock()
+
+        def advance_cooldown(delay: float) -> None:
+            delays.append(delay)
+            clock.advance(clg.COOLDOWN_SECONDS)
+
         with StubServer(TransientRejectingStub) as upstream, RunningRouter(
-            [{"name": "a", "port": upstream.port}], retry_sleeper=delays.append
+            [{"name": "a", "port": upstream.port}],
+            retry_sleeper=advance_cooldown,
+            monotonic_clock=clock,
         ) as router:
             status, body = request(router.port, proxy_payload())
 
@@ -199,11 +220,13 @@ class RouterTests(unittest.TestCase):
                 self.wfile.write(body)
 
         inflight_during_backoff: list[int] = []
+        clock = FakeMonotonicClock()
         with StubServer(TransientRejectingStub) as upstream, RunningRouter(
-            [{"name": "a", "port": upstream.port}]
+            [{"name": "a", "port": upstream.port}], monotonic_clock=clock
         ) as router:
             def inspect_backoff(_delay: float) -> None:
                 inflight_during_backoff.append(router.server.scheduler.snapshot()[0]["inflight"])
+                clock.advance(clg.COOLDOWN_SECONDS)
 
             router.server.retry_sleeper = inspect_backoff
             self.assertEqual(request(router.port, proxy_payload()), (200, b"ok"))
@@ -245,6 +268,144 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(RejectingStub.requests, 1)
         self.assertEqual(SuccessStub.requests, 1)
         self.assertLess(states["a"]["permits"], 6)
+
+    def test_websocket_403_cools_upstream_while_concurrent_request_uses_other_upstream(self) -> None:
+        # Regression lock: after a WebSocket 403 on /v1/messages, an independent
+        # generation request cannot immediately reuse the saturated account.
+        class RejectingStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if type(self).requests == 1:
+                    body = b"WebSocket upgrade was rejected"
+                    self.send_response(403)
+                else:
+                    body = b"recovered"
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        class SuccessStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        clock = FakeMonotonicClock()
+        with StubServer(RejectingStub) as first, StubServer(SuccessStub) as second, RunningRouter(
+            [{"name": "a", "port": first.port}, {"name": "b", "port": second.port}],
+            initial_permits=1,
+            monotonic_clock=clock,
+        ) as router:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                rejected = pool.submit(request, router.port, proxy_payload())
+                while RejectingStub.requests == 0:
+                    time.sleep(0.001)
+                status, body = request(router.port, proxy_payload())
+                states = {state["name"]: state for state in router.server.scheduler.snapshot()}
+                clock.advance(clg.COOLDOWN_SECONDS)
+                with router.server.scheduler._condition:
+                    router.server.scheduler._condition.notify_all()
+                rejected.result(timeout=2)
+
+        self.assertEqual((status, body), (200, b"ok"))
+        self.assertEqual(RejectingStub.requests, 1)
+        self.assertGreater(states["a"]["cooldown_remaining"], 0)
+        self.assertGreaterEqual(SuccessStub.requests, 1)
+
+    def test_all_cooling_waits_until_earliest_expiry(self) -> None:
+        clock = FakeMonotonicClock()
+        scheduler = clg.UpstreamScheduler(
+            [{"name": "a", "port": 1}, {"name": "b", "port": 2}],
+            initial_permits=1,
+            monotonic_clock=clock,
+        )
+        scheduler._upstreams[0].cooldown_until = 3.0
+        scheduler._upstreams[1].cooldown_until = 5.0
+        selected: list[object] = []
+        started = threading.Event()
+
+        def wait_for_capacity() -> None:
+            started.set()
+            selected.append(scheduler.acquire(timeout=1))
+
+        thread = threading.Thread(target=wait_for_capacity)
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        time.sleep(0.02)
+        self.assertTrue(thread.is_alive())
+        clock.advance(3.0)
+        with scheduler._condition:
+            scheduler._condition.notify_all()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(selected[0].name, "a")
+        scheduler.release(selected[0])
+
+    def test_all_cooling_wakes_at_earliest_expiry_without_notification(self) -> None:
+        scheduler = clg.UpstreamScheduler(
+            [{"name": "a", "port": 1}, {"name": "b", "port": 2}], initial_permits=1
+        )
+        now = time.monotonic()
+        scheduler._upstreams[0].cooldown_until = now + 0.05
+        scheduler._upstreams[1].cooldown_until = now + 0.20
+
+        started = time.monotonic()
+        selected = scheduler.acquire(timeout=0.5)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(selected.name, "a")
+        self.assertLess(elapsed, 0.15)
+        scheduler.release(selected)
+
+    def test_pinned_cooling_upstream_waits_for_its_expiry(self) -> None:
+        clock = FakeMonotonicClock()
+        scheduler = clg.UpstreamScheduler(
+            [{"name": "a", "port": 1}, {"name": "b", "port": 2}],
+            initial_permits=1,
+            monotonic_clock=clock,
+        )
+        scheduler._upstreams[0].cooldown_until = 4.0
+        selected: list[object] = []
+
+        thread = threading.Thread(target=lambda: selected.append(scheduler.acquire(only_name="a", timeout=1)))
+        thread.start()
+        time.sleep(0.02)
+        self.assertTrue(thread.is_alive())
+        clock.advance(4.0)
+        with scheduler._condition:
+            scheduler._condition.notify_all()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(selected[0].name, "a")
+        scheduler.release(selected[0])
+
+    def test_cooldown_expiry_restores_normal_selection(self) -> None:
+        clock = FakeMonotonicClock()
+        scheduler = clg.UpstreamScheduler(
+            [{"name": "a", "port": 1}, {"name": "b", "port": 2}],
+            initial_permits=1,
+            monotonic_clock=clock,
+        )
+        scheduler._upstreams[0].cooldown_until = 2.0
+        first = scheduler.acquire(timeout=0)
+        self.assertEqual(first.name, "b")
+        scheduler.release(first)
+        clock.advance(2.0)
+        restored = scheduler.acquire(only_name="a", timeout=0)
+        self.assertEqual(restored.name, "a")
+        scheduler.release(restored)
 
     def test_non_websocket_403_passes_through_once(self) -> None:
         class AuthFailureStub(QuietHandler):
@@ -414,8 +575,26 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(
             payload["upstreams"],
             [
-                {"free": 3, "inflight": 0, "name": "a", "permits": 3, "port": first.port, "successes": 0},
-                {"free": 3, "inflight": 0, "name": "b", "permits": 3, "port": second.port, "successes": 0},
+                {
+                    "cooldown_remaining": 0.0,
+                    "cooldown_until": 0.0,
+                    "free": 3,
+                    "inflight": 0,
+                    "name": "a",
+                    "permits": 3,
+                    "port": first.port,
+                    "successes": 0,
+                },
+                {
+                    "cooldown_remaining": 0.0,
+                    "cooldown_until": 0.0,
+                    "free": 3,
+                    "inflight": 0,
+                    "name": "b",
+                    "permits": 3,
+                    "port": second.port,
+                    "successes": 0,
+                },
             ],
         )
 
@@ -433,8 +612,16 @@ class RouterTests(unittest.TestCase):
                 self.wfile.write(body)
 
         delays: list[float] = []
+        clock = FakeMonotonicClock()
+
+        def advance_cooldown(delay: float) -> None:
+            delays.append(delay)
+            clock.advance(clg.COOLDOWN_SECONDS)
+
         with StubServer(RejectingStub) as upstream, RunningRouter(
-            [{"name": "a", "port": upstream.port}], retry_sleeper=delays.append
+            [{"name": "a", "port": upstream.port}],
+            retry_sleeper=advance_cooldown,
+            monotonic_clock=clock,
         ) as router:
             status, body = request(router.port, proxy_payload())
 
@@ -818,8 +1005,15 @@ class RouterTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+        clock = FakeMonotonicClock()
+
+        def advance_cooldown(_delay: float) -> None:
+            clock.advance(clg.COOLDOWN_SECONDS)
+
         with StubServer(UnpinnedStub) as first, StubServer(PinnedStub) as second, RunningRouter(
-            [{"name": "a", "port": first.port}, {"name": "b", "port": second.port}]
+            [{"name": "a", "port": first.port}, {"name": "b", "port": second.port}],
+            retry_sleeper=advance_cooldown,
+            monotonic_clock=clock,
         ) as router:
             conn = http.client.HTTPConnection("127.0.0.1", router.port, timeout=10)
             try:

@@ -73,6 +73,7 @@ ACQUIRE_TIMEOUT_SECONDS = 300.0
 RETRY_BODY_LIMIT = 65536
 RETRY_BASE_SECONDS = 0.4
 RETRY_JITTER_SECONDS = 0.3
+COOLDOWN_SECONDS = 20.0
 # Défauts de routage. Ils restent la référence : tant que routing.json est absent
 # ou illisible, clg se comporte exactement comme avant son externalisation.
 # `clgctl config` est le seul outil qui écrit ce fichier.
@@ -247,15 +248,22 @@ class UpstreamState:
     permits: int
     inflight: int = 0
     successes: int = 0
+    cooldown_until: float = 0.0
 
 
 class UpstreamScheduler:
     """FIFO proxy-account selection with per-account adaptive concurrency."""
 
-    def __init__(self, upstreams: list[dict], initial_permits: int = INITIAL_PERMITS) -> None:
+    def __init__(
+        self,
+        upstreams: list[dict],
+        initial_permits: int = INITIAL_PERMITS,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         if not upstreams:
             raise ValueError("at least one proxy upstream is required")
         self._condition = threading.Condition()
+        self._monotonic_clock = monotonic_clock
         self._upstreams = [
             UpstreamState(str(upstream["name"]), int(upstream["port"]), initial_permits)
             for upstream in upstreams
@@ -270,16 +278,17 @@ class UpstreamScheduler:
         timeout: float = ACQUIRE_TIMEOUT_SECONDS,
         only_name: str | None = None,
     ) -> UpstreamState:
-        deadline = time.monotonic() + timeout
+        deadline = self._monotonic_clock() + timeout
         with self._condition:
             ticket = self._next_ticket
             self._next_ticket += 1
             self._tickets.append(ticket)
             try:
                 while True:
+                    now = self._monotonic_clock()
                     available = [
                         upstream for upstream in self._upstreams
-                        if upstream.inflight < upstream.permits
+                        if upstream.inflight < upstream.permits and upstream.cooldown_until <= now
                     ]
                     if only_name is not None:
                         candidates = [upstream for upstream in available if upstream.name == only_name]
@@ -299,14 +308,33 @@ class UpstreamScheduler:
                         self._tickets.pop(0)
                         self._condition.notify_all()
                         return upstream
-                    remaining = deadline - time.monotonic()
+                    remaining = deadline - now
                     if remaining <= 0:
                         raise TimeoutError("timed out waiting for proxy capacity")
-                    self._condition.wait(remaining)
+                    eligible = self._eligible_upstreams(avoid_name, prefer_not_name, only_name)
+                    cooldown_wait = min(
+                        (upstream.cooldown_until - now for upstream in eligible if upstream.cooldown_until > now),
+                        default=remaining,
+                    )
+                    self._condition.wait(min(remaining, cooldown_wait))
             finally:
                 if ticket in self._tickets:
                     self._tickets.remove(ticket)
                     self._condition.notify_all()
+
+    def _eligible_upstreams(
+        self,
+        avoid_name: str | None,
+        prefer_not_name: str | None,
+        only_name: str | None,
+    ) -> list[UpstreamState]:
+        if only_name is not None:
+            return [upstream for upstream in self._upstreams if upstream.name == only_name]
+        if avoid_name is not None:
+            return [upstream for upstream in self._upstreams if upstream.name != avoid_name]
+        if prefer_not_name is not None:
+            return self._upstreams
+        return self._upstreams
 
     def select_unlimited(self, only_name: str | None = None) -> UpstreamState:
         """Select an upstream without consuming a generation permit."""
@@ -328,6 +356,7 @@ class UpstreamScheduler:
         with self._condition:
             upstream.permits = max(MIN_PERMITS, int(upstream.permits * AIMD_DECREASE_FACTOR))
             upstream.successes = 0
+            upstream.cooldown_until = self._monotonic_clock() + COOLDOWN_SECONDS
             self._condition.notify_all()
 
     def succeeded(self, upstream: UpstreamState) -> None:
@@ -344,6 +373,7 @@ class UpstreamScheduler:
 
     def snapshot(self) -> list[dict]:
         with self._condition:
+            now = self._monotonic_clock()
             return [
                 {
                     "name": upstream.name,
@@ -352,6 +382,8 @@ class UpstreamScheduler:
                     "inflight": upstream.inflight,
                     "free": max(0, upstream.permits - upstream.inflight),
                     "successes": upstream.successes,
+                    "cooldown_until": upstream.cooldown_until,
+                    "cooldown_remaining": max(0.0, upstream.cooldown_until - now),
                 }
                 for upstream in self._upstreams
             ]
@@ -366,6 +398,7 @@ class RouterServer(ThreadingHTTPServer):
         upstreams: list[dict],
         *,
         initial_permits: int = INITIAL_PERMITS,
+        monotonic_clock: Callable[[], float] | None = None,
         anthropic_connection_factory: Callable[[], http.client.HTTPConnection] | None = None,
         retry_sleeper: Callable[[float], None] = time.sleep,
         jitter_source: Callable[[], float] = random.random,
@@ -374,7 +407,11 @@ class RouterServer(ThreadingHTTPServer):
         delegate_port: int | None = None,
         pinned_upstream: str | None = None,
     ) -> None:
-        self.scheduler = UpstreamScheduler(upstreams, initial_permits)
+        self.scheduler = UpstreamScheduler(
+            upstreams,
+            initial_permits,
+            monotonic_clock or time.monotonic,
+        )
         self.delegate_port = delegate_port
         self.pinned_upstream = pinned_upstream
         self.anthropic_connection_factory = anthropic_connection_factory or (
