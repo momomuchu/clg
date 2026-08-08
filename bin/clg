@@ -68,7 +68,7 @@ MIN_PERMITS = 2
 MAX_PERMITS = 12
 AIMD_DECREASE_FACTOR = 0.75
 SUCCESS_WINDOW = 20
-MAX_PROXY_ATTEMPTS = 4
+MAX_PROXY_ATTEMPTS = 6
 ACQUIRE_TIMEOUT_SECONDS = 300.0
 RETRY_BODY_LIMIT = 65536
 RETRY_BASE_SECONDS = 0.4
@@ -266,6 +266,7 @@ class UpstreamScheduler:
     def acquire(
         self,
         avoid_name: str | None = None,
+        prefer_not_name: str | None = None,
         timeout: float = ACQUIRE_TIMEOUT_SECONDS,
         only_name: str | None = None,
     ) -> UpstreamState:
@@ -284,6 +285,9 @@ class UpstreamScheduler:
                         candidates = [upstream for upstream in available if upstream.name == only_name]
                     elif avoid_name is not None:
                         candidates = [upstream for upstream in available if upstream.name != avoid_name]
+                    elif prefer_not_name is not None:
+                        alternatives = [upstream for upstream in available if upstream.name != prefer_not_name]
+                        candidates = alternatives or available
                     else:
                         candidates = available
                     if self._tickets[0] == ticket and candidates:
@@ -303,13 +307,6 @@ class UpstreamScheduler:
                 if ticket in self._tickets:
                     self._tickets.remove(ticket)
                     self._condition.notify_all()
-
-    def has_available_alternative(self, name: str) -> bool:
-        with self._condition:
-            return any(
-                upstream.name != name and upstream.inflight < upstream.permits
-                for upstream in self._upstreams
-            )
 
     def select_unlimited(self, only_name: str | None = None) -> UpstreamState:
         """Select an upstream without consuming a generation permit."""
@@ -553,11 +550,11 @@ class RouterHandler(BaseHTTPRequestHandler):
         pinned_upstream: str | None,
     ) -> None:
         generation = self._is_generation_request()
-        avoid_name = None
+        prefer_not_name = None
         for attempt in range(1, MAX_PROXY_ATTEMPTS + 1):
             try:
                 upstream = self.server.scheduler.acquire(
-                    avoid_name=avoid_name,
+                    prefer_not_name=prefer_not_name,
                     only_name=pinned_upstream,
                 ) if generation else self.server.scheduler.select_unlimited(pinned_upstream)
             except TimeoutError as exc:
@@ -581,13 +578,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                         rejected = len(buffered) <= RETRY_BODY_LIMIT and b"WebSocket upgrade" in buffered
                         if rejected and generation:
                             self.server.scheduler.websocket_rejected(upstream)
-                            if (
-                                attempt < MAX_PROXY_ATTEMPTS
-                                and pinned_upstream is None
-                                and self.server.scheduler.has_available_alternative(upstream.name)
-                            ):
+                            if attempt < MAX_PROXY_ATTEMPTS:
                                 retry = True
-                                avoid_name = upstream.name
+                                prefer_not_name = upstream.name if pinned_upstream is None else None
                             else:
                                 self._send_response(response, buffered)
                         else:

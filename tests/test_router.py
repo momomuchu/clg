@@ -63,6 +63,7 @@ class RunningRouter:
         anthropic_port: int | None = None,
         route_logger: object | None = None,
         proxy_connection_factory: object | None = None,
+        retry_sleeper: object | None = None,
     ) -> None:
         anthropic_factory = None
         if anthropic_port is not None:
@@ -74,7 +75,9 @@ class RunningRouter:
             upstreams,
             initial_permits=initial_permits,
             anthropic_connection_factory=anthropic_factory,
-            retry_sleeper=lambda _delay: None,
+            retry_sleeper=(
+                retry_sleeper if retry_sleeper is not None else lambda _delay: None
+            ),
             jitter_source=lambda: 0.0,
             route_logger=route_logger or (lambda _message: None),
             proxy_connection_factory=proxy_connection_factory,
@@ -155,6 +158,58 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(all(status == 200 for status, _body in results))
         self.assertLessEqual(CappedStub.max_inflight, 3)
 
+    def test_websocket_403_retries_on_same_upstream_after_backoff(self) -> None:
+        class TransientRejectingStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if type(self).requests == 1:
+                    body = b"WebSocket upgrade was rejected"
+                    self.send_response(403)
+                else:
+                    body = b"retried-same-upstream"
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        delays: list[float] = []
+        with StubServer(TransientRejectingStub) as upstream, RunningRouter(
+            [{"name": "a", "port": upstream.port}], retry_sleeper=delays.append
+        ) as router:
+            status, body = request(router.port, proxy_payload())
+
+        self.assertEqual((status, body), (200, b"retried-same-upstream"))
+        self.assertEqual(TransientRejectingStub.requests, 2)
+        self.assertEqual(delays, [clg.RETRY_BASE_SECONDS])
+
+    def test_websocket_retry_releases_permit_before_backoff(self) -> None:
+        class TransientRejectingStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"WebSocket upgrade was rejected" if type(self).requests == 1 else b"ok"
+                self.send_response(403 if type(self).requests == 1 else 200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        inflight_during_backoff: list[int] = []
+        with StubServer(TransientRejectingStub) as upstream, RunningRouter(
+            [{"name": "a", "port": upstream.port}]
+        ) as router:
+            def inspect_backoff(_delay: float) -> None:
+                inflight_during_backoff.append(router.server.scheduler.snapshot()[0]["inflight"])
+
+            router.server.retry_sleeper = inspect_backoff
+            self.assertEqual(request(router.port, proxy_payload()), (200, b"ok"))
+
+        self.assertEqual(inflight_during_backoff, [0])
+
     def test_websocket_403_retries_on_another_upstream_and_decreases_permits(self) -> None:
         class RejectingStub(QuietHandler):
             requests = 0
@@ -190,6 +245,29 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(RejectingStub.requests, 1)
         self.assertEqual(SuccessStub.requests, 1)
         self.assertLess(states["a"]["permits"], 6)
+
+    def test_non_websocket_403_passes_through_once(self) -> None:
+        class AuthFailureStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"authentication rejected"
+                self.send_response(403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        delays: list[float] = []
+        with StubServer(AuthFailureStub) as upstream, RunningRouter(
+            [{"name": "a", "port": upstream.port}], retry_sleeper=delays.append
+        ) as router:
+            status, body = request(router.port, proxy_payload())
+
+        self.assertEqual((status, body), (403, b"authentication rejected"))
+        self.assertEqual(AuthFailureStub.requests, 1)
+        self.assertEqual(delays, [])
 
     def test_non_retry_statuses_pass_through_once(self) -> None:
         for expected_status in (500, 413):
@@ -341,7 +419,7 @@ class RouterTests(unittest.TestCase):
             ],
         )
 
-    def test_all_websocket_retries_fail_with_last_response_unchanged(self) -> None:
+    def test_persistent_websocket_403_gives_up_after_retry_budget(self) -> None:
         class RejectingStub(QuietHandler):
             requests = 0
 
@@ -354,14 +432,16 @@ class RouterTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+        delays: list[float] = []
         with StubServer(RejectingStub) as upstream, RunningRouter(
-            [{"name": "a", "port": upstream.port}]
+            [{"name": "a", "port": upstream.port}], retry_sleeper=delays.append
         ) as router:
             status, body = request(router.port, proxy_payload())
 
-        self.assertEqual(RejectingStub.requests, 1)
+        self.assertEqual(RejectingStub.requests, clg.MAX_PROXY_ATTEMPTS)
         self.assertEqual(status, 403)
-        self.assertEqual(body, b"WebSocket upgrade was rejected attempt-1")
+        self.assertEqual(body, f"WebSocket upgrade was rejected attempt-{clg.MAX_PROXY_ATTEMPTS}".encode())
+        self.assertEqual(len(delays), clg.MAX_PROXY_ATTEMPTS - 1)
 
     def test_aimd_additive_increase_is_bounded(self) -> None:
         scheduler = clg.UpstreamScheduler([{"name": "a", "port": 1}], initial_permits=3)
@@ -586,6 +666,71 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(clg._token_cache[0], "fresh")
         clg.invalidate_oauth_token("fresh")
         self.assertIsNone(clg._token_cache)
+
+    def test_pinned_websocket_retry_stays_on_pinned_upstream(self) -> None:
+        class UnpinnedStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Length", "8")
+                self.end_headers()
+                self.wfile.write(b"unwanted")
+
+        class PinnedStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if type(self).requests == 1:
+                    body = b"WebSocket upgrade was rejected"
+                    self.send_response(403)
+                else:
+                    body = b"pinned-ok"
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        with StubServer(UnpinnedStub) as first, StubServer(PinnedStub) as second, RunningRouter(
+            [{"name": "a", "port": first.port}, {"name": "b", "port": second.port}]
+        ) as router:
+            conn = http.client.HTTPConnection("127.0.0.1", router.port, timeout=10)
+            try:
+                body = json.dumps(proxy_payload()).encode()
+                conn.request(
+                    "POST", "/v1/messages", body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                        clg.PINNED_UPSTREAM_HEADER: "b",
+                    },
+                )
+                response = conn.getresponse()
+                status, payload = response.status, response.read()
+            finally:
+                conn.close()
+
+        self.assertEqual((status, payload), (200, b"pinned-ok"))
+        self.assertEqual(UnpinnedStub.requests, 0)
+        self.assertEqual(PinnedStub.requests, 2)
+
+    def test_retry_preference_falls_back_to_rejected_upstream_when_alternative_is_busy(self) -> None:
+        scheduler = clg.UpstreamScheduler(
+            [{"name": "a", "port": 1}, {"name": "b", "port": 2}], initial_permits=1
+        )
+        preferred = scheduler.acquire(prefer_not_name="a", timeout=0)
+        self.assertEqual(preferred.name, "b")
+        scheduler.release(preferred)
+
+        occupied_alternative = scheduler.acquire(only_name="b", timeout=0)
+        fallback = scheduler.acquire(prefer_not_name="a", timeout=0)
+        self.assertEqual(fallback.name, "a")
+        scheduler.release(fallback)
+        scheduler.release(occupied_alternative)
 
     def test_pinned_compatibility_router_delegates_to_shared_scheduler(self) -> None:
         class A(QuietHandler):
