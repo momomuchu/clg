@@ -806,7 +806,10 @@ def start_proxy(name: str, acc: dict) -> bool:
     port = acc["port"]
     if proxy_healthy(port):
         return True
-    if acc.get("brew"):
+    # `brew` est vrai par défaut pour le compte "a" (cf. DEFAULT_ACCOUNTS) et se propage aussi
+    # via un accounts.json copié depuis un Mac. Sans le which(), subprocess lève FileNotFoundError
+    # sur toute machine sans Homebrew et clg meurt avant même d'essayer PROXY_BIN, qui lui est là.
+    if acc.get("brew") and shutil.which("brew"):
         subprocess.run(
             ["brew", "services", "restart", BREW_FORMULA],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
