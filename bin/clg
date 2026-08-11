@@ -233,11 +233,12 @@ def route_model(model: str, payload: dict) -> tuple[str, str]:
     """-> (destination, modèle effectif). Seul le chat principal va chez Anthropic."""
     model = model.removesuffix("[1m]")
     if model == MAIN_MODEL:
-        # Seul le chat principal (ou sa compaction) va chez Anthropic ; tout
-        # sub-agent — natif ou custom — qui hérite du modèle part sur GPT.
+        # Seul le chat principal (ou sa compaction) va chez Anthropic. Claude Code
+        # résout aussi un sous-agent opus en MAIN_MODEL avant ce routeur ; il garde
+        # donc le tier opus côté proxy.
         if main_chat_request(payload):
             return "anthropic", model
-        return "proxy", INHERITED
+        return "proxy", SOL
     if model.startswith(("claude-opus", "opus", "claude-fable", "fable")):
         return "proxy", SOL
     return "proxy", model

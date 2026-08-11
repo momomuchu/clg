@@ -610,14 +610,25 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(ProxyStub.requests, 0)
 
     def test_routing_table(self) -> None:
-        inherited = proxy_payload("claude-opus-5")
-        self.assertEqual(clg.route_model("claude-opus-5", inherited), ("proxy", clg.TERRA))
+        subagent_payload = {
+            "model": "claude-opus-5",
+            "system": [{"type": "text", "text": "<Agent_Prompt>\n<Role>\nYou are implementation-executor"}],
+            "messages": [],
+        }
+        self.assertEqual(
+            clg.route_model("claude-opus-5", subagent_payload),
+            ("proxy", clg.SOL),
+        )
         self.assertEqual(
             clg.route_model("claude-fable-1", proxy_payload("claude-fable-1")),
             ("proxy", clg.SOL),
         )
+        main_chat_payload = {
+            **subagent_payload,
+            "system": [{"type": "text", "text": "You are an interactive agent running Claude Code"}],
+        }
         self.assertEqual(
-            clg.route_model("claude-opus-5[1m]", main_payload()),
+            clg.route_model("claude-opus-5", main_chat_payload),
             ("anthropic", "claude-opus-5"),
         )
 
