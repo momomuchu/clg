@@ -97,8 +97,10 @@ DEFAULT_ROUTING = {
     "main_chat": "anthropic",
     # Fenêtre annoncée à Claude Code quand le chat tourne sur GPT. Sans elle, le
     # CLI ne reconnaît pas le modèle, avertit à chaque lancement et suppose 200k.
-    # Jamais exportée en mode anthropic : elle écraserait le 1M d'Opus.
-    "main_context_tokens": "200000",
+    # 272k est la fenêtre de toute la famille gpt-5.x au catalogue Codex : le 1M
+    # est celle d'Opus, pas celle des modèles du proxy. Jamais exportée en mode
+    # anthropic, où elle écraserait justement ce 1M.
+    "main_context_tokens": "272000",
     # Taux de remplissage du contexte déclenchant l'auto-compaction, en pour
     # cent. Plus la valeur est haute, plus la compaction est tardive et rare.
     # Vide = on laisse le CLI décider.
