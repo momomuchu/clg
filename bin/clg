@@ -59,7 +59,7 @@ DEFAULT_REGISTRY = {
 }
 
 ROUTER_PORT_OFFSET = 10000
-SHARED_ROUTER_PORT = 28765
+SHARED_ROUTER_PORT = 28700
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 SOCKET_READ_TIMEOUT_SECONDS = 600
 PINNED_UPSTREAM_HEADER = "X-CLG-Pinned-Upstream"
@@ -69,6 +69,11 @@ MAX_PERMITS = 12
 AIMD_DECREASE_FACTOR = 0.75
 SUCCESS_WINDOW = 20
 MAX_PROXY_ATTEMPTS = 4
+# Statuts Anthropic sur lesquels une compaction bascule sur GPT plutôt que
+# d'échouer. Uniquement de la capacité (quota, surcharge) : une erreur d'auth
+# doit rester visible, la masquer par un repli rendrait le problème indébogable.
+COMPACTION_FALLBACK_STATUSES = (429, 529)
+COMPACTION_ANTHROPIC_ATTEMPTS = 3
 ACQUIRE_TIMEOUT_SECONDS = 300.0
 RETRY_BODY_LIMIT = 65536
 RETRY_BASE_SECONDS = 0.4
@@ -82,6 +87,18 @@ RETRY_JITTER_SECONDS = 0.3
 DEFAULT_ROUTING = {
     "main_model": "claude-opus-5",
     "main_model_env": "claude-opus-5[1m]",
+    # Modèle Anthropic servant la compaction. Claude est entraîné pour cette
+    # tâche précise, et le résumé conditionne toute la suite de la session :
+    # c'est la dernière surface qu'on veut voir dégrader. Elle reste donc sur
+    # Anthropic même quand tout le reste — chat principal compris — est GPT.
+    "compact_model": "claude-opus-5",
+    # Où va le chat principal : "anthropic" (défaut) ou "gpt". La compaction
+    # ne suit pas ce réglage, elle est toujours servie par compact_model.
+    "main_chat": "anthropic",
+    # Fenêtre annoncée à Claude Code quand le chat tourne sur GPT. Sans elle, le
+    # CLI ne reconnaît pas le modèle, avertit à chaque lancement et suppose 200k.
+    # Jamais exportée en mode anthropic : elle écraserait le 1M d'Opus.
+    "main_context_tokens": "200000",
     "tiers": {
         "opus": "gpt-5.6-sol",
         "sonnet": "gpt-5.6-terra",
@@ -102,15 +119,30 @@ def load_routing(account: str | None = None) -> dict:
     cfg = {
         "main_model": DEFAULT_ROUTING["main_model"],
         "main_model_env": DEFAULT_ROUTING["main_model_env"],
+        "compact_model": DEFAULT_ROUTING["compact_model"],
+        "main_chat": DEFAULT_ROUTING["main_chat"],
+        "main_context_tokens": DEFAULT_ROUTING["main_context_tokens"],
         "tiers": dict(DEFAULT_ROUTING["tiers"]),
         "overrides": {},
     }
     try:
         raw = json.loads(ROUTING_FILE.read_text())
-        for key in ("main_model", "main_model_env"):
+        for key in ("main_model", "main_model_env", "compact_model", "main_context_tokens"):
             value = raw.get(key)
             if isinstance(value, str) and value.strip():
                 cfg[key] = value
+        # Une valeur inconnue ne doit pas router au hasard : on garde le défaut
+        # et on le dit, plutôt que de deviner ce que l'utilisateur voulait.
+        main_chat = raw.get("main_chat")
+        if isinstance(main_chat, str) and main_chat.strip():
+            if main_chat in ("anthropic", "gpt"):
+                cfg["main_chat"] = main_chat
+            else:
+                print(
+                    f"clg: main_chat={main_chat!r} inconnu (anthropic|gpt) — "
+                    f"{cfg['main_chat']!r} conservé.",
+                    file=sys.stderr,
+                )
         for tier, model in (raw.get("tiers") or {}).items():
             if tier in cfg["tiers"] and isinstance(model, str) and model.strip():
                 cfg["tiers"][tier] = model
@@ -131,20 +163,26 @@ def load_routing(account: str | None = None) -> dict:
 ROUTING = load_routing()
 MAIN_MODEL = ROUTING["main_model"]
 MAIN_MODEL_ENV = ROUTING["main_model_env"]
-# Whitelist : seules les requêtes du chat principal (et sa compaction) vont chez
-# Anthropic. Les blocs system observés sont [billing-header, identité, corps] et
-# l'identité est partagée par main et sub-agents — le discriminant fiable est le
-# corps : la boucle principale contient "You are an interactive agent", la
-# compaction son prompt summarizer. Tout le reste (sub-agents natifs "You are an
-# agent for...", customs avec leur propre prompt) part sur GPT.
-MAIN_SYSTEM_MARKERS = (
-    "You are an interactive agent",
-    "You are a helpful AI assistant tasked with summarizing conversations",
-)
+COMPACT_MODEL = ROUTING["compact_model"]
+MAIN_CHAT_UPSTREAM = ROUTING["main_chat"]
+# Whitelist : deux surfaces seulement peuvent aller chez Anthropic, et elles
+# sont distinguées séparément parce qu'elles se configurent séparément. Les
+# blocs system observés sont [billing-header, identité, corps] et l'identité est
+# partagée par main et sub-agents — le discriminant fiable est le corps. Tout le
+# reste (sub-agents natifs "You are an agent for...", customs avec leur propre
+# prompt) part sur GPT.
+MAIN_SYSTEM_MARKERS = ("You are an interactive agent",)
+# Vérifié dans le binaire Claude Code 2.1.228 : la compaction envoie un bloc
+# system unique, `systemPrompt: of(["You are a helpful AI assistant tasked with
+# summarizing conversations."])`. Ce marqueur n'apparaît jamais dans les logs
+# tant que le chat principal tourne en 1M — la compaction ne se déclenche pas.
+COMPACTION_MARKERS = ("You are a helpful AI assistant tasked with summarizing conversations",)
 SOL = ROUTING["tiers"]["opus"]
 TERRA = ROUTING["tiers"]["sonnet"]
 LUNA = ROUTING["tiers"]["haiku"]
 INHERITED = ROUTING["tiers"]["inherited"]
+# Seuls les noms déjà GPT traversent le routeur sans traduction.
+GPT_PREFIX = "gpt-"
 ANTHROPIC_HOST = "api.anthropic.com"
 OAUTH_BETA = "oauth-2025-04-20"
 
@@ -218,26 +256,60 @@ def system_blocks(payload: dict) -> list[str]:
     return []
 
 
-def main_chat_request(payload: dict) -> bool:
-    """Vrai si la requête vient du chat principal (ou de sa compaction)."""
+def _has_marker(payload: dict, markers: tuple[str, ...]) -> bool:
     for block in system_blocks(payload)[:4]:
-        if any(marker in block[:500] for marker in MAIN_SYSTEM_MARKERS):
+        if any(marker in block[:500] for marker in markers):
             return True
     return False
 
 
-def route_model(model: str, payload: dict) -> tuple[str, str]:
-    """-> (destination, modèle effectif). Seul le chat principal va chez Anthropic."""
-    model = model.removesuffix("[1m]")
+def main_chat_request(payload: dict) -> bool:
+    """Vrai si la requête vient de la boucle du chat principal."""
+    return _has_marker(payload, MAIN_SYSTEM_MARKERS)
+
+
+def compaction_request(payload: dict) -> bool:
+    """Vrai si la requête est une compaction de conversation."""
+    return _has_marker(payload, COMPACTION_MARKERS)
+
+
+def gpt_model_for(model: str) -> str:
+    """Modèle GPT servant `model` côté proxy.
+
+    Fail-closed : on n'énumère que ce qui a le droit de passer tel quel (les
+    `gpt-*`), tout le reste est traduit vers un tier. L'inverse — laisser filer
+    le nom d'origine — est ce qui envoyait `claude-sonnet-5` et
+    `claude-haiku-4-5-*` au proxy, qui choisissait alors le modèle réel
+    lui-même, hors de routing.json. Le proxy sert aussi grok/kimi/deepseek/glm :
+    un nom inconnu doit atterrir sur un GPT, jamais être relayé au hasard.
+    """
+    if model.startswith(GPT_PREFIX):
+        return model
     if model == MAIN_MODEL:
-        # Seul le chat principal (ou sa compaction) va chez Anthropic ; tout
-        # sub-agent — natif ou custom — qui hérite du modèle part sur GPT.
-        if main_chat_request(payload):
-            return "anthropic", model
-        return "proxy", INHERITED
-    if model.startswith(("claude-opus", "opus", "claude-fable", "fable")):
-        return "proxy", SOL
-    return "proxy", model
+        # Sub-agent — natif ou custom — qui hérite du modèle du chat principal.
+        return INHERITED
+    name = model.lower()
+    if "opus" in name or "fable" in name:
+        return SOL
+    if "sonnet" in name:
+        return TERRA
+    if "haiku" in name:
+        return LUNA
+    return INHERITED
+
+
+def route_model(model: str, payload: dict) -> tuple[str, str]:
+    """-> (destination, modèle effectif). Deux surfaces peuvent aller chez Anthropic."""
+    model = model.removesuffix("[1m]")
+    # La compaction se teste en premier, et sans regarder le modèle : quand le
+    # chat principal est servi par GPT, elle arrive avec un nom `gpt-*`, et un
+    # test conditionné au modèle ne la verrait jamais. On réécrit le modèle.
+    if compaction_request(payload):
+        return "anthropic", COMPACT_MODEL
+    if MAIN_CHAT_UPSTREAM == "anthropic" and model == MAIN_MODEL and main_chat_request(payload):
+        return "anthropic", model
+    # Tout le reste part sur GPT, y compris les sub-agents qui héritent du modèle.
+    return "proxy", gpt_model_for(model)
 
 
 @dataclass
@@ -447,30 +519,44 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         target = "proxy"
         route_details: tuple[str, list[str]] | None = None
+        fallback: dict[str, object] | None = None
         if body:
             try:
                 payload = json.loads(body)
             except Exception:
                 payload = None
             if isinstance(payload, dict) and isinstance(payload.get("model"), str):
-                target, model = route_model(payload["model"], payload)
-                display_model = payload["model"] if model == payload["model"] else f"{payload['model']} -> {model}"
+                requested = payload["model"]
+                target, model = route_model(requested, payload)
+                display_model = requested if model == requested else f"{requested} -> {model}"
                 route_details = (display_model, [block[:50] for block in system_blocks(payload)[:3]])
-                if model != payload["model"]:
+                if model != requested:
                     payload["model"] = model
                     body = json.dumps(payload).encode()
+                # Une compaction ne doit jamais échouer : si Anthropic est à bout
+                # de quota ou surchargé, on la sert en GPT plutôt que de casser
+                # la session. On prépare le corps de repli tant qu'on a le payload.
+                if target == "anthropic" and compaction_request(payload):
+                    degraded = gpt_model_for(requested.removesuffix("[1m]"))
+                    fallback = {
+                        "model": degraded,
+                        "body": json.dumps(dict(payload, model=degraded)).encode(),
+                    }
 
         headers = self._forward_headers(target, body)
         pinned_upstream = self.headers.get(PINNED_UPSTREAM_HEADER)
         if target == "anthropic":
             token = oauth_token()
             if not token:
+                if fallback is not None:
+                    self._compaction_fallback(fallback, route_details, "OAuth Anthropic introuvable")
+                    return
                 self._error(502, "clg-router: OAuth Anthropic introuvable (Keychain 'Claude Code-credentials'). Lance `claude` une fois pour te ré-authentifier.")
                 return
             headers["authorization"] = f"Bearer {token}"
             beta = headers.pop("anthropic-beta", None) or headers.pop("Anthropic-Beta", None)
             headers["anthropic-beta"] = f"{beta},{OAUTH_BETA}" if beta and OAUTH_BETA not in beta else (beta or OAUTH_BETA)
-            self._relay_anthropic(body, headers, route_details, token)
+            self._relay_anthropic(body, headers, route_details, token, fallback)
             return
         self._relay_proxy(body, headers, route_details, pinned_upstream)
 
@@ -502,28 +588,72 @@ class RouterHandler(BaseHTTPRequestHandler):
             % (target, display_model, system, upstream, attempt)
         )
 
+    def _compaction_fallback(
+        self,
+        fallback: dict[str, object],
+        route_details: tuple[str, list[str]] | None,
+        reason: str,
+    ) -> None:
+        """Dernier recours : servir la compaction en GPT au lieu d'échouer.
+
+        La compaction est censée être servie par Claude — c'est la tâche pour
+        laquelle il est entraîné. Ce chemin est une dégradation, pas un mode de
+        fonctionnement : il est journalisé explicitement pour rester visible.
+        """
+        body = fallback["body"]
+        self.server.route_logger(
+            "compaction degradee (%s) -> proxy %s\n" % (reason, fallback["model"])
+        )
+        details = None
+        if route_details is not None:
+            details = (f"COMPACTION degradee -> {fallback['model']}", route_details[1])
+        self._relay_proxy(
+            body,
+            self._forward_headers("proxy", body),
+            details,
+            self.headers.get(PINNED_UPSTREAM_HEADER),
+        )
+
     def _relay_anthropic(
         self,
         body: bytes,
         headers: dict[str, str],
         route_details: tuple[str, list[str]] | None,
         token: str,
+        fallback: dict[str, object] | None = None,
     ) -> None:
-        conn = self.server.anthropic_connection_factory()
-        self._log_route("anthropic", route_details, ANTHROPIC_HOST, 1)
-        try:
-            conn.request(self.command, self.path, body=body or None, headers=headers)
-            response = conn.getresponse()
-        except Exception as exc:
+        # Une compaction insiste auprès d'Anthropic avant de se dégrader : le
+        # 429 est souvent transitoire, et basculer au premier refus reviendrait
+        # à abandonner Opus pour rien.
+        attempts = COMPACTION_ANTHROPIC_ATTEMPTS if fallback is not None else 1
+        response = None
+        for attempt in range(1, attempts + 1):
+            conn = self.server.anthropic_connection_factory()
+            self._log_route("anthropic", route_details, ANTHROPIC_HOST, attempt)
+            try:
+                conn.request(self.command, self.path, body=body or None, headers=headers)
+                response = conn.getresponse()
+            except Exception as exc:
+                conn.close()
+                if fallback is not None:
+                    self._compaction_fallback(fallback, route_details, f"injoignable: {exc}")
+                    return
+                self._error(502, f"clg-router: upstream anthropic injoignable: {exc}")
+                return
+            if response.status == 401:
+                invalidate_oauth_token(token)
+            if fallback is None or response.status not in COMPACTION_FALLBACK_STATUSES:
+                try:
+                    self._send_response(response)
+                finally:
+                    conn.close()
+                return
             conn.close()
-            self._error(502, f"clg-router: upstream anthropic injoignable: {exc}")
-            return
-        if response.status == 401:
-            invalidate_oauth_token(token)
-        try:
-            self._send_response(response)
-        finally:
-            conn.close()
+            if attempt < attempts:
+                self.server.retry_sleeper(RETRY_BASE_SECONDS * attempt)
+        self._compaction_fallback(
+            fallback, route_details, f"anthropic {response.status if response else '???'}"
+        )
 
     def _relay_delegate(self, body: bytes) -> None:
         """Compatibility listener which delegates pinning to the shared scheduler."""
@@ -980,6 +1110,9 @@ def main() -> None:
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
         "DISABLE_AUTO_COMPACT", "DISABLE_COMPACT",
         "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+        # Purgée puis réexportée seulement en mode GPT : une valeur héritée du
+        # shell clamperait la fenêtre 1M du chat Opus.
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
     ):
         env.pop(var, None)
     env.update(
@@ -994,9 +1127,20 @@ def main() -> None:
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
         CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1",
     )
+    if routing["main_chat"] == "gpt" and routing["main_context_tokens"].strip():
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = routing["main_context_tokens"]
 
+    # Le bandeau doit dire la vérité sur le mode courant : annoncer « Anthropic
+    # réel » alors que le chat tourne sur GPT rendrait toute erreur de config
+    # invisible au lancement, là où elle est le moins chère à corriger.
+    if routing["main_chat"] == "anthropic":
+        chat_desc = f"chat={main_model_env} (Anthropic réel, contexte 1M)"
+    else:
+        chat_desc = f"chat={main_model_env} (GPT via proxy)"
     print(
-        f"clg: chat={main_model_env} (Anthropic réel, contexte 1M) · routeur={'partagé' if shared else '@' + selector} · sub-agents GPT: opus/fable→{sol}, sans modèle/sonnet→{terra}, haiku→{luna}",
+        f"clg: {chat_desc} · compaction={routing['compact_model']} (Anthropic)"
+        f" · routeur={'partagé' if shared else '@' + selector}"
+        f" · sub-agents GPT: opus/fable→{sol}, sans modèle/sonnet→{terra}, haiku→{luna}",
         file=sys.stderr,
     )
 

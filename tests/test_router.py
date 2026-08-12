@@ -123,6 +123,16 @@ def main_payload() -> dict[str, object]:
 
 
 class RouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Le module lit ~/.config/clg/.../routing.json au chargement : sans ce
+        # verrou, la config locale de la machine ferait passer ou échouer la
+        # suite. Ces tests décrivent le comportement par défaut.
+        self._main_chat = clg.MAIN_CHAT_UPSTREAM
+        clg.MAIN_CHAT_UPSTREAM = "anthropic"
+
+    def tearDown(self) -> None:
+        clg.MAIN_CHAT_UPSTREAM = self._main_chat
+
     def test_cap_enforced(self) -> None:
         class CappedStub(QuietHandler):
             lock = threading.Lock()
@@ -314,6 +324,84 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(
             clg.route_model("claude-opus-5[1m]", main_payload()),
             ("anthropic", "claude-opus-5"),
+        )
+
+    def test_every_anthropic_family_is_translated_to_gpt(self) -> None:
+        """Régression : sonnet/haiku partaient au proxy sans traduction."""
+        for model, expected in (
+            ("claude-sonnet-5", clg.TERRA),
+            ("claude-sonnet-4-5", clg.TERRA),
+            ("sonnet", clg.TERRA),
+            ("claude-haiku-4-5-20251001", clg.LUNA),
+            ("claude-3-5-haiku-20241022", clg.LUNA),
+            ("haiku", clg.LUNA),
+            ("claude-opus-4-8", clg.SOL),
+            ("opus", clg.SOL),
+            ("fable", clg.SOL),
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    clg.route_model(model, proxy_payload(model)), ("proxy", expected)
+                )
+
+    def test_gpt_models_pass_through_untouched(self) -> None:
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    clg.route_model(model, proxy_payload(model)), ("proxy", model)
+                )
+
+    def test_non_gpt_upstream_models_never_reach_the_proxy_verbatim(self) -> None:
+        """Le proxy sert aussi grok/kimi/deepseek : rien de tout ça ne doit sortir."""
+        for model in ("grok-4.5", "kimi-k3", "deepseek-v4-pro", "glm-5.2", "qwen3.7-max"):
+            with self.subTest(model=model):
+                target, effective = clg.route_model(model, proxy_payload(model))
+                self.assertEqual(target, "proxy")
+                self.assertTrue(effective.startswith(clg.GPT_PREFIX), effective)
+
+    def test_compaction_reaches_anthropic_whatever_the_incoming_model(self) -> None:
+        """Le prompt de compaction est le discriminant, pas le modèle."""
+        compaction = {
+            "model": "ignored",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a helpful AI assistant tasked with "
+                    "summarizing conversations.",
+                }
+            ],
+        }
+        for incoming in ("claude-opus-5", "gpt-5.6-sol", "gpt-5.6-terra"):
+            with self.subTest(incoming=incoming):
+                self.assertEqual(
+                    clg.route_model(incoming, compaction),
+                    ("anthropic", clg.COMPACT_MODEL),
+                )
+
+    def test_main_chat_follows_the_main_chat_setting(self) -> None:
+        original = clg.MAIN_CHAT_UPSTREAM
+        try:
+            clg.MAIN_CHAT_UPSTREAM = "gpt"
+            self.assertEqual(
+                clg.route_model(clg.MAIN_MODEL, main_payload()),
+                ("proxy", clg.INHERITED),
+            )
+            clg.MAIN_CHAT_UPSTREAM = "anthropic"
+            self.assertEqual(
+                clg.route_model(clg.MAIN_MODEL, main_payload()),
+                ("anthropic", clg.MAIN_MODEL),
+            )
+        finally:
+            clg.MAIN_CHAT_UPSTREAM = original
+
+    def test_main_model_reaches_anthropic_only_for_the_main_chat(self) -> None:
+        self.assertEqual(
+            clg.route_model(clg.MAIN_MODEL, proxy_payload(clg.MAIN_MODEL)),
+            ("proxy", clg.INHERITED),
+        )
+        self.assertEqual(
+            clg.route_model(clg.MAIN_MODEL, main_payload()),
+            ("anthropic", clg.MAIN_MODEL),
         )
 
     def test_health_reports_upstream_capacity(self) -> None:
@@ -606,6 +694,171 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(shared.server.scheduler.snapshot()[1]["inflight"], 0)
             finally:
                 relay.shutdown(); relay.server_close(); thread.join(2)
+
+
+COMPACTION_TEXT = (
+    "You are a helpful AI assistant tasked with summarizing conversations."
+)
+
+
+def compaction_payload(model: str = "claude-opus-5", blocks: list[str] | None = None) -> dict:
+    system = [{"type": "text", "text": text} for text in (blocks or [COMPACTION_TEXT])]
+    return {"model": model, "system": system, "messages": []}
+
+
+class CompactionRoutingTests(unittest.TestCase):
+    """La compaction est toujours servie par Claude, quel que soit le mode."""
+
+    def _with_main_chat(self, value: str):
+        original = clg.MAIN_CHAT_UPSTREAM
+        clg.MAIN_CHAT_UPSTREAM = value
+        self.addCleanup(lambda: setattr(clg, "MAIN_CHAT_UPSTREAM", original))
+
+    def test_compaction_goes_to_anthropic_in_both_modes(self) -> None:
+        for mode in ("anthropic", "gpt"):
+            for model in ("claude-opus-5", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "sonnet"):
+                with self.subTest(main_chat=mode, model=model):
+                    self._with_main_chat(mode)
+                    self.assertEqual(
+                        clg.route_model(model, compaction_payload(model)),
+                        ("anthropic", clg.COMPACT_MODEL),
+                    )
+
+    def test_compaction_accepts_the_1m_suffix(self) -> None:
+        self.assertEqual(
+            clg.route_model("claude-opus-5[1m]", compaction_payload("claude-opus-5[1m]")),
+            ("anthropic", clg.COMPACT_MODEL),
+        )
+
+    def test_compaction_detected_behind_a_billing_header_block(self) -> None:
+        payload = compaction_payload(
+            blocks=["x-anthropic-billing-header: cc_version=2.1.228", COMPACTION_TEXT]
+        )
+        self.assertEqual(
+            clg.route_model("gpt-5.6-sol", payload), ("anthropic", clg.COMPACT_MODEL)
+        )
+
+    def test_compaction_as_a_plain_string_system(self) -> None:
+        payload = {"model": "gpt-5.6-sol", "system": COMPACTION_TEXT, "messages": []}
+        self.assertEqual(
+            clg.route_model("gpt-5.6-sol", payload), ("anthropic", clg.COMPACT_MODEL)
+        )
+
+    def test_compaction_wins_over_the_main_chat_marker(self) -> None:
+        """Si les deux marqueurs coexistent, la compaction prime."""
+        self._with_main_chat("anthropic")
+        payload = compaction_payload(
+            blocks=[COMPACTION_TEXT, "You are an interactive agent that helps users"]
+        )
+        self.assertEqual(
+            clg.route_model("claude-opus-5", payload), ("anthropic", clg.COMPACT_MODEL)
+        )
+
+    def test_marker_past_the_scan_window_falls_back_to_gpt(self) -> None:
+        """Limite assumée : au-delà de 4 blocs ou 500 caractères, on ne voit rien."""
+        deep = compaction_payload(blocks=["filler"] * 4 + [COMPACTION_TEXT])
+        target, _ = clg.route_model("gpt-5.6-sol", deep)
+        self.assertEqual(target, "proxy")
+        buried = compaction_payload(blocks=["x" * 501 + COMPACTION_TEXT])
+        target, _ = clg.route_model("gpt-5.6-sol", buried)
+        self.assertEqual(target, "proxy")
+
+    def test_subagents_never_reach_anthropic_in_either_mode(self) -> None:
+        for mode in ("anthropic", "gpt"):
+            for model in ("claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol"):
+                with self.subTest(main_chat=mode, model=model):
+                    self._with_main_chat(mode)
+                    target, effective = clg.route_model(model, proxy_payload(model))
+                    self.assertEqual(target, "proxy")
+                    self.assertTrue(effective.startswith(clg.GPT_PREFIX), effective)
+
+
+class CompactionFallbackTests(unittest.TestCase):
+    """Une compaction ne doit jamais échouer : Anthropic d'abord, GPT en dernier."""
+
+    def _stubs(self, anthropic_status: int):
+        class AnthropicStub(QuietHandler):
+            calls = 0
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                type(self).calls += 1
+                self.send_response(anthropic_status)
+                self.send_header("Content-Length", "9")
+                self.end_headers()
+                self.wfile.write(b"anthropic")
+
+        class ProxyStub(QuietHandler):
+            calls = 0
+            models: list[str] = []
+
+            def do_POST(self) -> None:
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                type(self).calls += 1
+                type(self).models.append(json.loads(raw)["model"])
+                self.send_response(200)
+                self.send_header("Content-Length", "5")
+                self.end_headers()
+                self.wfile.write(b"proxy")
+
+        return AnthropicStub, ProxyStub
+
+    def _run(self, anthropic_status: int, payload: dict, token: str | None = "t"):
+        AnthropicStub, ProxyStub = self._stubs(anthropic_status)
+        original = clg.oauth_token
+        clg.oauth_token = lambda: token
+        try:
+            with StubServer(ProxyStub) as proxy, StubServer(AnthropicStub) as anthropic, RunningRouter(
+                [{"name": "a", "port": proxy.port}], anthropic_port=anthropic.port
+            ) as router:
+                status, body = request(router.port, payload)
+        finally:
+            clg.oauth_token = original
+        return status, body, AnthropicStub, ProxyStub
+
+    def test_429_retries_anthropic_then_degrades_to_gpt(self) -> None:
+        status, body, anthropic, proxy = self._run(429, compaction_payload("gpt-5.6-sol"))
+        self.assertEqual((status, body), (200, b"proxy"))
+        self.assertEqual(anthropic.calls, clg.COMPACTION_ANTHROPIC_ATTEMPTS)
+        self.assertEqual(proxy.models, ["gpt-5.6-sol"])
+
+    def test_529_overloaded_also_degrades(self) -> None:
+        status, body, anthropic, proxy = self._run(529, compaction_payload("claude-opus-5"))
+        self.assertEqual((status, body), (200, b"proxy"))
+        self.assertEqual(anthropic.calls, clg.COMPACTION_ANTHROPIC_ATTEMPTS)
+        self.assertEqual(proxy.models, [clg.INHERITED])
+
+    def test_401_is_never_masked_by_a_fallback(self) -> None:
+        status, _, anthropic, proxy = self._run(401, compaction_payload("gpt-5.6-sol"))
+        self.assertEqual(status, 401)
+        self.assertEqual(anthropic.calls, 1)
+        self.assertEqual(proxy.calls, 0)
+
+    def test_successful_compaction_never_touches_the_proxy(self) -> None:
+        status, body, anthropic, proxy = self._run(200, compaction_payload("gpt-5.6-sol"))
+        self.assertEqual((status, body), (200, b"anthropic"))
+        self.assertEqual(anthropic.calls, 1)
+        self.assertEqual(proxy.calls, 0)
+
+    def test_missing_oauth_degrades_instead_of_502(self) -> None:
+        status, body, anthropic, proxy = self._run(
+            200, compaction_payload("gpt-5.6-sol"), token=None
+        )
+        self.assertEqual((status, body), (200, b"proxy"))
+        self.assertEqual(anthropic.calls, 0)
+        self.assertEqual(proxy.models, ["gpt-5.6-sol"])
+
+    def test_main_chat_429_is_passed_through_not_degraded(self) -> None:
+        """Le repli est réservé à la compaction ; le chat principal voit son 429."""
+        original = clg.MAIN_CHAT_UPSTREAM
+        clg.MAIN_CHAT_UPSTREAM = "anthropic"
+        try:
+            status, _, anthropic, proxy = self._run(429, main_payload())
+        finally:
+            clg.MAIN_CHAT_UPSTREAM = original
+        self.assertEqual(status, 429)
+        self.assertEqual(anthropic.calls, 1)
+        self.assertEqual(proxy.calls, 0)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,41 @@ flowchart LR
 | Subagents `sonnet` | `gpt-5.6-terra` | proxy |
 | Subagents `haiku` | `gpt-5.6-luna` | proxy |
 | Subagents with **no model** (inherited) — native *and* custom agents | `gpt-5.6-terra` | proxy |
+| Any other model id (`claude-sonnet-5`, `claude-haiku-4-5-…`, `grok-*`, `kimi-*`, …) | its tier, else `gpt-5.6-terra` | proxy |
+
+### Compaction is always Claude
+
+Compaction is the one task Claude is specifically trained for, and its summary
+conditions everything that follows in the session — so it is served by
+`compact_model` (`claude-opus-5`) **regardless of every other setting**. It is
+detected by its system prompt alone, never by the incoming model id, because
+when the main chat runs on GPT the compaction request arrives carrying a `gpt-*`
+name; the router rewrites it.
+
+`main_chat` (`anthropic` | `gpt`) selects where the main chat goes and does
+**not** affect compaction:
+
+```sh
+clgctl config set main_chat=gpt              # main chat on GPT…
+clgctl config set main_model_env=gpt-5.6-sol # …served by sol
+# compaction still goes to claude-opus-5
+```
+
+Putting the main chat on GPT costs the 1M window, so compaction stops being
+theoretical and starts firing regularly. To keep it from becoming a hard
+dependency on Anthropic quota, a compaction that is rate-limited (`429`) or hits
+an overloaded API (`529`) retries Anthropic three times and only then degrades to
+GPT — logged as `compaction degradee (…)`, because it is a degradation, not a
+mode. Auth failures (`401`) are never masked this way: hiding them behind a
+fallback would make them undebuggable.
+
+The main chat is, apart from compaction, the **only** surface that reaches Anthropic. Everything else is
+served by a GPT model, and model translation is fail-closed: only ids already
+prefixed `gpt-` cross the router untouched, everything else is mapped to a tier by
+family (`opus`/`fable`→sol, `sonnet`→terra, `haiku`→luna, unknown→inherited). This
+matters because the proxy also serves non-GPT models (grok, kimi, deepseek, glm,
+qwen): forwarding an id verbatim would hand model choice to the proxy, outside
+`routing.json`.
 
 The router tells the main thread apart from inherited-model subagents by the
 request's system prompt (whitelist, fail-safe: anything unrecognized or malformed goes
