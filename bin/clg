@@ -99,6 +99,10 @@ DEFAULT_ROUTING = {
     # CLI ne reconnaît pas le modèle, avertit à chaque lancement et suppose 200k.
     # Jamais exportée en mode anthropic : elle écraserait le 1M d'Opus.
     "main_context_tokens": "200000",
+    # Taux de remplissage du contexte déclenchant l'auto-compaction, en pour
+    # cent. Plus la valeur est haute, plus la compaction est tardive et rare.
+    # Vide = on laisse le CLI décider.
+    "autocompact_pct": "90",
     "tiers": {
         "opus": "gpt-5.6-sol",
         "sonnet": "gpt-5.6-terra",
@@ -122,12 +126,14 @@ def load_routing(account: str | None = None) -> dict:
         "compact_model": DEFAULT_ROUTING["compact_model"],
         "main_chat": DEFAULT_ROUTING["main_chat"],
         "main_context_tokens": DEFAULT_ROUTING["main_context_tokens"],
+        "autocompact_pct": DEFAULT_ROUTING["autocompact_pct"],
         "tiers": dict(DEFAULT_ROUTING["tiers"]),
         "overrides": {},
     }
     try:
         raw = json.loads(ROUTING_FILE.read_text())
-        for key in ("main_model", "main_model_env", "compact_model", "main_context_tokens"):
+        for key in ("main_model", "main_model_env", "compact_model", "main_context_tokens",
+                    "autocompact_pct"):
             value = raw.get(key)
             if isinstance(value, str) and value.strip():
                 cfg[key] = value
@@ -1129,6 +1135,11 @@ def main() -> None:
     )
     if routing["main_chat"] == "gpt" and routing["main_context_tokens"].strip():
         env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = routing["main_context_tokens"]
+    # Purgée plus haut puis réexportée ici : une valeur héritée du shell ferait
+    # compacter à un seuil qu'on n'a pas choisi, ce qui est exactement le
+    # symptôme qu'on cherche à contrôler.
+    if routing["autocompact_pct"].strip():
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = routing["autocompact_pct"].strip()
 
     # Le bandeau doit dire la vérité sur le mode courant : annoncer « Anthropic
     # réel » alors que le chat tourne sur GPT rendrait toute erreur de config

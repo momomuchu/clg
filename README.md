@@ -51,6 +51,12 @@ clgctl config set main_model_env=gpt-5.6-sol # …served by sol
 # compaction still goes to claude-opus-5
 ```
 
+`autocompact_pct` (default `90`) is the context fill percentage at which the CLI
+auto-compacts — raise it to compact later and less often, lower it to compact
+sooner. It is exported as `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, after that variable
+is purged from the inherited environment, so the threshold is always the one
+configured here rather than whatever a shell happened to export.
+
 Putting the main chat on GPT costs the 1M window, so compaction stops being
 theoretical and starts firing regularly. To keep it from becoming a hard
 dependency on Anthropic quota, a compaction that is rate-limited (`429`) or hits

@@ -72,6 +72,8 @@ DEFAULT_ROUTING = {
     "main_chat": "anthropic",
     # Fenêtre annoncée à Claude Code en mode GPT uniquement.
     "main_context_tokens": "200000",
+    # Seuil de remplissage (%) déclenchant l'auto-compaction.
+    "autocompact_pct": "90",
     "tiers": {
         "opus": "gpt-5.6-sol",
         "sonnet": "gpt-5.6-terra",
@@ -83,6 +85,7 @@ DEFAULT_ROUTING = {
 TIER_KEYS = tuple(DEFAULT_ROUTING["tiers"])
 SCALAR_KEYS = (
     "main_model", "main_model_env", "compact_model", "main_chat", "main_context_tokens",
+    "autocompact_pct",
 )
 MAIN_CHAT_VALUES = ("anthropic", "gpt")
 
@@ -384,6 +387,19 @@ STATE_READERS = {"claude": claude_state, "codex": codex_state, "proxy": proxy_st
 # Routage GPT
 # ---------------------------------------------------------------------------
 
+def check_autocompact_pct(value: str) -> None:
+    """Un seuil hors bornes ne se voit qu'au moment où la compaction ne part
+    jamais — ou part tout le temps. Autant refuser à l'écriture."""
+    if not value.strip():
+        return
+    try:
+        pct = int(value)
+    except ValueError:
+        raise ValueError(f"autocompact_pct doit être un entier (reçu '{value}')") from None
+    if not 1 <= pct <= 100:
+        raise ValueError(f"autocompact_pct doit être entre 1 et 100 (reçu {pct})")
+
+
 def validate_routing(cfg: object) -> dict:
     """Refuse plutôt que de deviner : une config de routage à moitié valide
     enverrait silencieusement le trafic sur un modèle inexistant."""
@@ -399,6 +415,7 @@ def validate_routing(cfg: object) -> dict:
             f"main_chat doit valoir {' ou '.join(MAIN_CHAT_VALUES)} "
             f"(reçu '{out['main_chat']}')"
         )
+    check_autocompact_pct(out["autocompact_pct"])
     tiers = cfg.get("tiers", {})
     if not isinstance(tiers, dict):
         raise ValueError("tiers doit être un objet")
@@ -719,6 +736,11 @@ def cmd_config(args) -> int:
                     f"clgctl config set: main_chat doit valoir "
                     f"{' ou '.join(MAIN_CHAT_VALUES)} (reçu '{value}')"
                 )
+            if key == "autocompact_pct":
+                try:
+                    check_autocompact_pct(value)
+                except ValueError as exc:
+                    sys.exit(f"clgctl config set: {exc}")
             cfg[key] = value
         else:
             sys.exit(f"clgctl config set: clé inconnue '{key}'")
