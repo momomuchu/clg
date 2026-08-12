@@ -97,10 +97,13 @@ DEFAULT_ROUTING = {
     "main_chat": "anthropic",
     # Fenêtre annoncée à Claude Code quand le chat tourne sur GPT. Sans elle, le
     # CLI ne reconnaît pas le modèle, avertit à chaque lancement et suppose 200k.
-    # 272k est la fenêtre de toute la famille gpt-5.x au catalogue Codex : le 1M
-    # est celle d'Opus, pas celle des modèles du proxy. Jamais exportée en mode
-    # anthropic, où elle écraserait justement ce 1M.
-    "main_context_tokens": "272000",
+    # Mesuré sur gpt-5.6-sol via le proxy : 342 010 tokens acceptés, ~400k
+    # refusés (413 request_too_large). On déclare juste en dessous du plancher
+    # constaté, pour que la requête de compaction elle-même rentre encore : si
+    # elle ne rentre pas, la session ne peut plus se compacter du tout. Le 1M
+    # est la fenêtre d'Opus, pas celle des modèles du proxy — d'où le fait que
+    # cette variable ne soit jamais exportée en mode anthropic.
+    "main_context_tokens": "340000",
     # Taux de remplissage du contexte déclenchant l'auto-compaction, en pour
     # cent. Plus la valeur est haute, plus la compaction est tardive et rare.
     # Vide = on laisse le CLI décider.

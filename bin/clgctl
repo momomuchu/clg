@@ -71,7 +71,7 @@ DEFAULT_ROUTING = {
     # Où va le chat principal : "anthropic" (défaut) ou "gpt".
     "main_chat": "anthropic",
     # Fenêtre annoncée à Claude Code en mode GPT uniquement.
-    "main_context_tokens": "272000",
+    "main_context_tokens": "340000",
     # Seuil de remplissage (%) déclenchant l'auto-compaction.
     "autocompact_pct": "90",
     "tiers": {

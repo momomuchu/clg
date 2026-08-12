@@ -122,16 +122,32 @@ def main_payload() -> dict[str, object]:
     }
 
 
-class RouterTests(unittest.TestCase):
+class HermeticRouting:
+    """Épingle le routage sur les défauts compilés.
+
+    Le module lit ~/.config/clg/fleet/gpt/routing.json au chargement, donc sans
+    ce verrou la suite passe ou échoue selon la config de la machine — un
+    `clgctl config set tiers.inherited=…` suffit à faire tomber des tests qui
+    n'ont rien à voir. Ces tests décrivent le comportement par défaut.
+    """
+
+    _PINNED = {"SOL": "opus", "TERRA": "sonnet", "LUNA": "haiku", "INHERITED": "inherited"}
+
     def setUp(self) -> None:
-        # Le module lit ~/.config/clg/.../routing.json au chargement : sans ce
-        # verrou, la config locale de la machine ferait passer ou échouer la
-        # suite. Ces tests décrivent le comportement par défaut.
-        self._main_chat = clg.MAIN_CHAT_UPSTREAM
-        clg.MAIN_CHAT_UPSTREAM = "anthropic"
+        super().setUp()
+        self._saved = {name: getattr(clg, name) for name in self._PINNED}
+        self._saved["MAIN_CHAT_UPSTREAM"] = clg.MAIN_CHAT_UPSTREAM
+        for name, tier in self._PINNED.items():
+            setattr(clg, name, clg.DEFAULT_ROUTING["tiers"][tier])
+        clg.MAIN_CHAT_UPSTREAM = clg.DEFAULT_ROUTING["main_chat"]
 
     def tearDown(self) -> None:
-        clg.MAIN_CHAT_UPSTREAM = self._main_chat
+        for name, value in self._saved.items():
+            setattr(clg, name, value)
+        super().tearDown()
+
+
+class RouterTests(HermeticRouting, unittest.TestCase):
 
     def test_cap_enforced(self) -> None:
         class CappedStub(QuietHandler):
@@ -706,13 +722,11 @@ def compaction_payload(model: str = "claude-opus-5", blocks: list[str] | None = 
     return {"model": model, "system": system, "messages": []}
 
 
-class CompactionRoutingTests(unittest.TestCase):
+class CompactionRoutingTests(HermeticRouting, unittest.TestCase):
     """La compaction est toujours servie par Claude, quel que soit le mode."""
 
     def _with_main_chat(self, value: str):
-        original = clg.MAIN_CHAT_UPSTREAM
         clg.MAIN_CHAT_UPSTREAM = value
-        self.addCleanup(lambda: setattr(clg, "MAIN_CHAT_UPSTREAM", original))
 
     def test_compaction_goes_to_anthropic_in_both_modes(self) -> None:
         for mode in ("anthropic", "gpt"):
@@ -773,7 +787,7 @@ class CompactionRoutingTests(unittest.TestCase):
                     self.assertTrue(effective.startswith(clg.GPT_PREFIX), effective)
 
 
-class CompactionFallbackTests(unittest.TestCase):
+class CompactionFallbackTests(HermeticRouting, unittest.TestCase):
     """Une compaction ne doit jamais échouer : Anthropic d'abord, GPT en dernier."""
 
     def _stubs(self, anthropic_status: int):
