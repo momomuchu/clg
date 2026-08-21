@@ -76,6 +76,16 @@ RETRY_JITTER_SECONDS = 0.3
 RETRY_TOTAL_BUDGET_SECONDS = 180.0
 RETRY_MAX_SLEEP_SECONDS = 15.0
 COOLDOWN_SECONDS = 20.0
+# Plafond du Retry-After honoré sur un 429. Un compte épuisé pour la journée annonce
+# parfois des heures ; le plafonner garde une reprise automatique sans écarter le
+# compte pour toute la session.
+RATE_LIMIT_MAX_COOLDOWN_SECONDS = 900.0
+# Anthropic indisponible ou saturé : on rejoue le chat principal sur le proxy plutôt que
+# d'obliger l'opérateur à changer de modèle à la main. 529 = overloaded côté Anthropic.
+# 401 est délibérément absent : une auth expirée doit rester visible, pas être masquée
+# par une bascule silencieuse. 4xx de requête invalide non plus — la bascule ne les
+# réparerait pas, elle changerait juste le message d'erreur.
+ANTHROPIC_FALLBACK_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
 # Défauts de routage. Ils restent la référence : tant que routing.json est absent
 # ou illisible, clg se comporte exactement comme avant son externalisation.
 # `clgctl config` est le seul outil qui écrit ce fichier.
@@ -95,6 +105,21 @@ DEFAULT_ROUTING = {
 }
 
 
+def parse_retry_after(value: str | None) -> float | None:
+    """Return the delta-seconds form of Retry-After, or None when absent/unusable.
+
+    Only the integer-seconds form is honoured; the HTTP-date form is ignored so a
+    clock skew between us and the upstream can never park an account indefinitely.
+    """
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
+
+
 def load_routing(account: str | None = None) -> dict:
     """Config de routage effective, surcharge de compte appliquée.
 
@@ -107,6 +132,7 @@ def load_routing(account: str | None = None) -> dict:
         "main_model_env": DEFAULT_ROUTING["main_model_env"],
         "tiers": dict(DEFAULT_ROUTING["tiers"]),
         "overrides": {},
+        "agents": {},
     }
     try:
         raw = json.loads(ROUTING_FILE.read_text())
@@ -119,6 +145,12 @@ def load_routing(account: str | None = None) -> dict:
                 cfg["tiers"][tier] = model
         overrides = raw.get("overrides")
         cfg["overrides"] = overrides if isinstance(overrides, dict) else {}
+        agents = raw.get("agents")
+        if isinstance(agents, dict):
+            cfg["agents"] = {
+                str(name): str(model) for name, model in agents.items()
+                if isinstance(model, str) and model.strip()
+            }
     except FileNotFoundError:
         pass
     except Exception as exc:
@@ -140,14 +172,32 @@ MAIN_MODEL_ENV = ROUTING["main_model_env"]
 # corps : la boucle principale contient "You are an interactive agent", la
 # compaction son prompt summarizer. Tout le reste (sub-agents natifs "You are an
 # agent for...", customs avec leur propre prompt) part sur GPT.
-MAIN_SYSTEM_MARKERS = (
-    "You are an interactive agent",
+# Le chat principal s'identifie par son PREMIER bloc système substantiel, pas par une
+# phrase cherchée n'importe où : "You are an interactive agent" apparaît aussi dans les
+# prompts de sous-agent, donc il ne discrimine rien. Mesuré sur clg-router-shared.log :
+# ~62k requêtes de chat principal parties sur le proxy, et 164 sous-agents partis chez
+# Anthropic, à cause de ce marqueur ambigu.
+MAIN_IDENTITY_PREFIXES = (
+    "You are Claude Code, Anthropic's official CLI",
     "You are a helpful AI assistant tasked with summarizing conversations",
 )
+# Vérifié dans le binaire Claude Code 2.1.238. La liste de refus est prioritaire : un
+# sous-agent ne doit JAMAIS consommer le quota Anthropic, même si son prompt contient
+# une formule du chat principal.
+SUBAGENT_IDENTITY_PREFIXES = (
+    "You are a Claude agent,",
+    "You are an agent for Claude Code,",
+    "You are a subagent spawned by",
+    "A user kicked off a Claude Code agent",
+)
+# Blocs de transport qui précèdent l'identité réelle et ne l'expriment pas.
+NON_IDENTITY_PREFIXES = ("x-anthropic-billing-header",)
 SOL = ROUTING["tiers"]["opus"]
 TERRA = ROUTING["tiers"]["sonnet"]
 LUNA = ROUTING["tiers"]["haiku"]
+RETIRED_MODEL_ALIASES = {"grok-4.5": LUNA}
 INHERITED = ROUTING["tiers"]["inherited"]
+AGENT_ROUTING = ROUTING.get("agents") or {}
 ANTHROPIC_HOST = "api.anthropic.com"
 OAUTH_BETA = "oauth-2025-04-20"
 
@@ -221,23 +271,70 @@ def system_blocks(payload: dict) -> list[str]:
     return []
 
 
+def agent_card_name(payload: dict) -> str | None:
+    """Nom de la carte d'agent personnalisee portee par la requete, s'il y en a une.
+
+    Une carte d'agent EST un bloc systeme, et elle commence par son titre markdown.
+    Mesure sur 241 208 requetes proxy de clg-router-shared.log : 58 885 portent un tel
+    bloc, TOUJOURS en position 2, sur 27 noms distincts et zero exception. C'est ce qui
+    permet de router par agent, et pas seulement par tier: le tier est fige dans
+    l'environnement au lancement de Claude Code, le nom de la carte arrive a chaque
+    requete.
+    """
+    for block in system_blocks(payload):
+        stripped = block.strip()
+        if not stripped.startswith("#"):
+            continue
+        head = stripped[1:].strip().split("\n", 1)[0].strip()
+        if head and all(c.isalnum() or c in "-_" for c in head):
+            return head
+    return None
+
+
+def identity_block(payload: dict) -> str:
+    """Premier bloc système qui exprime une identité, en sautant les blocs de transport."""
+    for block in system_blocks(payload):
+        stripped = block.strip()
+        if not stripped or stripped.startswith(NON_IDENTITY_PREFIXES):
+            continue
+        return stripped
+    return ""
+
+
 def main_chat_request(payload: dict) -> bool:
-    """Vrai si la requête vient du chat principal (ou de sa compaction)."""
-    for block in system_blocks(payload)[:4]:
-        if any(marker in block[:500] for marker in MAIN_SYSTEM_MARKERS):
-            return True
-    return False
+    """Vrai si la requête vient du chat principal (ou de sa compaction).
+
+    Décidé sur le bloc d'identité ancré en début de chaîne, jamais sur une phrase
+    cherchée au milieu : les deux familles de prompts partagent des formules.
+    Le refus l'emporte, pour que l'erreur coûte de la qualité et jamais du quota.
+    """
+    identity = identity_block(payload)
+    if identity.startswith(SUBAGENT_IDENTITY_PREFIXES):
+        return False
+    return identity.startswith(MAIN_IDENTITY_PREFIXES)
 
 
 def route_model(model: str, payload: dict) -> tuple[str, str]:
     """-> (destination, modèle effectif). Seul le chat principal va chez Anthropic."""
     model = model.removesuffix("[1m]")
+    # L'identité de la requête est évaluée AVANT la famille de modèle. Auparavant un
+    # chat principal sur Fable, Opus 4.8 ou Sonnet tombait dans la branche `startswith`
+    # sans qu'on demande jamais si c'était le chat principal, et partait sur GPT — y
+    # compris sa compaction, qui envoie toute la conversation d'un coup.
+    if model.startswith("claude-") and main_chat_request(payload):
+        return "anthropic", model
+    # Routage par agent. Claude Code fige la carte des tiers dans son environnement au
+    # lancement, donc un tier ne peut pas changer en cours de session ; le nom de la carte
+    # d'agent, lui, arrive a chaque requete. C'est le seul point ou l'on peut envoyer un
+    # role precis vers un autre fournisseur sans relancer et sans que Claude Code ait a
+    # connaitre ce fournisseur. Une entree absente ne change rien.
+    card = agent_card_name(payload)
+    if card and card in AGENT_ROUTING:
+        return "proxy", AGENT_ROUTING[card]
+    model = RETIRED_MODEL_ALIASES.get(model, model)
     if model == MAIN_MODEL:
-        # Seul le chat principal (ou sa compaction) va chez Anthropic. Claude Code
-        # résout aussi un sous-agent opus en MAIN_MODEL avant ce routeur ; il garde
-        # donc le tier opus côté proxy.
-        if main_chat_request(payload):
-            return "anthropic", model
+        # Claude Code résout un sous-agent opus en MAIN_MODEL avant ce routeur ; il
+        # garde donc le tier opus côté proxy.
         return "proxy", SOL
     if model.startswith(("claude-opus", "opus", "claude-fable", "fable")):
         return "proxy", SOL
@@ -252,6 +349,16 @@ class UpstreamState:
     inflight: int = 0
     successes: int = 0
     cooldown_until: float = 0.0
+    # Modeles que CE compte sert reellement. Vide = sert tout, comportement d'origine.
+    # Un compte Grok ou DeepSeek ne sert pas les modeles GPT, et le catalogue /v1/models
+    # ne le dit pas: il annonce ce que le proxy SUPPORTE, pas ce a quoi le compte a droit.
+    # Mesure du 2026-08-21: un compte authentifie Grok annonce gpt-5.6-sol et repond 429.
+    models: tuple[str, ...] = ()
+
+    def serves(self, model: str | None) -> bool:
+        if not self.models or model is None:
+            return True
+        return any(model == m or model.startswith(m.rstrip("*")) for m in self.models)
 
 
 class UpstreamScheduler:
@@ -268,7 +375,10 @@ class UpstreamScheduler:
         self._condition = threading.Condition()
         self._monotonic_clock = monotonic_clock
         self._upstreams = [
-            UpstreamState(str(upstream["name"]), int(upstream["port"]), initial_permits)
+            UpstreamState(
+                str(upstream["name"]), int(upstream["port"]), initial_permits,
+                models=tuple(str(m) for m in (upstream.get("models") or ())),
+            )
             for upstream in upstreams
         ]
         self._tickets: list[int] = []
@@ -280,6 +390,7 @@ class UpstreamScheduler:
         prefer_not_name: str | None = None,
         timeout: float = ACQUIRE_TIMEOUT_SECONDS,
         only_name: str | None = None,
+        model: str | None = None,
     ) -> UpstreamState:
         deadline = self._monotonic_clock() + timeout
         with self._condition:
@@ -291,7 +402,8 @@ class UpstreamScheduler:
                     now = self._monotonic_clock()
                     available = [
                         upstream for upstream in self._upstreams
-                        if upstream.inflight < upstream.permits and upstream.cooldown_until <= now
+                        if upstream.serves(model)
+                        and upstream.inflight < upstream.permits and upstream.cooldown_until <= now
                     ]
                     if only_name is not None:
                         candidates = [upstream for upstream in available if upstream.name == only_name]
@@ -314,7 +426,7 @@ class UpstreamScheduler:
                     remaining = deadline - now
                     if remaining <= 0:
                         raise TimeoutError("timed out waiting for proxy capacity")
-                    eligible = self._eligible_upstreams(avoid_name, prefer_not_name, only_name)
+                    eligible = self._eligible_upstreams(avoid_name, prefer_not_name, only_name, model)
                     cooldown_wait = min(
                         (upstream.cooldown_until - now for upstream in eligible if upstream.cooldown_until > now),
                         default=remaining,
@@ -330,24 +442,28 @@ class UpstreamScheduler:
         avoid_name: str | None,
         prefer_not_name: str | None,
         only_name: str | None,
+        model: str | None = None,
     ) -> list[UpstreamState]:
+        # Le filtre modele est applique EN PREMIER: un compte qui ne sert pas ce modele
+        # n'est pas un candidat degrade, il n'est pas un candidat du tout. Sans ce filtre,
+        # la bascule enverrait une requete GPT sur un compte Grok et compterait son echec
+        # comme une saturation.
+        pool = [u for u in self._upstreams if u.serves(model)]
         if only_name is not None:
-            return [upstream for upstream in self._upstreams if upstream.name == only_name]
+            return [upstream for upstream in pool if upstream.name == only_name]
         if avoid_name is not None:
-            return [upstream for upstream in self._upstreams if upstream.name != avoid_name]
-        if prefer_not_name is not None:
-            return self._upstreams
-        return self._upstreams
+            return [upstream for upstream in pool if upstream.name != avoid_name]
+        return pool
 
-    def select_unlimited(self, only_name: str | None = None) -> UpstreamState:
+    def select_unlimited(self, only_name: str | None = None, model: str | None = None) -> UpstreamState:
         """Select an upstream without consuming a generation permit."""
         with self._condition:
             candidates = [
                 upstream for upstream in self._upstreams
-                if only_name is None or upstream.name == only_name
+                if upstream.serves(model) and (only_name is None or upstream.name == only_name)
             ]
             if not candidates:
-                raise ValueError(f"unknown proxy upstream: {only_name}")
+                raise ValueError(f"no proxy upstream serves model {model!r} (only_name={only_name!r})")
             return max(candidates, key=lambda item: (item.permits - item.inflight, -item.inflight))
 
     def release(self, upstream: UpstreamState) -> None:
@@ -360,6 +476,22 @@ class UpstreamScheduler:
             upstream.permits = max(MIN_PERMITS, int(upstream.permits * AIMD_DECREASE_FACTOR))
             upstream.successes = 0
             upstream.cooldown_until = self._monotonic_clock() + COOLDOWN_SECONDS
+            self._condition.notify_all()
+
+    def rate_limited(self, upstream: UpstreamState, retry_after: float | None = None) -> None:
+        """Park a rate-limited upstream so selection skips it, then retry elsewhere.
+
+        A 429 means this account has no capacity right now, not that the request is
+        bad. Honour Retry-After when the upstream states one so an exhausted account
+        is parked for its stated duration instead of being resolicited every cooldown.
+        """
+        with self._condition:
+            upstream.permits = max(MIN_PERMITS, int(upstream.permits * AIMD_DECREASE_FACTOR))
+            upstream.successes = 0
+            wait = COOLDOWN_SECONDS
+            if retry_after is not None:
+                wait = max(wait, min(retry_after, RATE_LIMIT_MAX_COOLDOWN_SECONDS))
+            upstream.cooldown_until = self._monotonic_clock() + wait
             self._condition.notify_all()
 
     def succeeded(self, upstream: UpstreamState) -> None:
@@ -381,6 +513,7 @@ class UpstreamScheduler:
                 {
                     "name": upstream.name,
                     "port": upstream.port,
+                    "models": list(upstream.models),
                     "permits": upstream.permits,
                     "inflight": upstream.inflight,
                     "free": max(0, upstream.permits - upstream.inflight),
@@ -553,14 +686,60 @@ class RouterHandler(BaseHTTPRequestHandler):
             response = conn.getresponse()
         except Exception as exc:
             conn.close()
+            if self._fallback_to_proxy(body, route_details, f"injoignable: {exc}"):
+                return
             self._error(502, f"clg-router: upstream anthropic injoignable: {exc}")
             return
         if response.status == 401:
             invalidate_oauth_token(token)
+        if response.status in ANTHROPIC_FALLBACK_STATUSES:
+            # Anthropic est indisponible, pas la requête invalide. Plutôt que d'obliger
+            # l'opérateur à changer de modèle à la main, on sert la même requête sur le
+            # proxy. La bascule est journalisée : on ne change jamais de modèle en silence.
+            reason = f"status={response.status}"
+            try:
+                response.read(RETRY_BODY_LIMIT + 1)
+            except Exception:
+                pass
+            conn.close()
+            if self._fallback_to_proxy(body, route_details, reason):
+                return
+            conn = None
         try:
             self._send_response(response)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
+
+    def _fallback_to_proxy(
+        self,
+        body: bytes,
+        route_details: tuple[str, list[str]] | None,
+        reason: str,
+    ) -> bool:
+        """Rejoue une requête de chat principal sur le proxy quand Anthropic est indisponible.
+
+        Retourne False si rien n'a été envoyé, pour que l'appelant garde la main sur
+        l'erreur. Ne se déclenche jamais une fois la réponse commencée côté client.
+        """
+        if self._downstream_committed or not body:
+            return False
+        try:
+            payload = json.loads(body)
+        except Exception:
+            return False
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+            return False
+        original = payload["model"]
+        payload["model"] = SOL
+        new_body = json.dumps(payload).encode()
+        self.server.route_logger(
+            "route %-9s %-22s fallback=%s upstream=%s\n"
+            % ("anth->proxy", f"{original} -> {SOL}", reason, "proxy-pool")
+        )
+        details = (f"{original} -> {SOL} (fallback {reason})", route_details[1] if route_details else [])
+        self._relay_proxy(new_body, self._forward_headers("proxy", new_body), details, None)
+        return True
 
     def _relay_delegate(self, body: bytes) -> None:
         """Compatibility listener which delegates pinning to the shared scheduler."""
@@ -655,6 +834,16 @@ class RouterHandler(BaseHTTPRequestHandler):
         prefer_not_name = None
         retry_started = self.server.scheduler._monotonic_clock()
         attempt = 0
+        # Le modele effectif decide quels comptes sont candidats. route_model l'a deja
+        # reecrit dans le corps, donc c'est bien le nom qui partira a l'upstream.
+        wanted_model = None
+        if body:
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and isinstance(parsed.get("model"), str):
+                    wanted_model = parsed["model"]
+            except Exception:
+                wanted_model = None
         while True:
             attempt += 1
             try:
@@ -668,9 +857,16 @@ class RouterHandler(BaseHTTPRequestHandler):
                     prefer_not_name=prefer_not_name,
                     only_name=pinned_upstream,
                     timeout=min(ACQUIRE_TIMEOUT_SECONDS, retry_remaining),
-                ) if generation else self.server.scheduler.select_unlimited(pinned_upstream)
+                    model=wanted_model,
+                ) if generation else self.server.scheduler.select_unlimited(pinned_upstream, model=wanted_model)
             except TimeoutError as exc:
                 self._error(503, f"clg-router: capacité proxy indisponible: {exc}")
+                return
+            except ValueError as exc:
+                # Aucun compte ne sert ce modele. C'est une erreur de configuration, pas
+                # une saturation: le dire explicitement plutot que d'essayer un compte au
+                # hasard et de compter son refus comme un rate limit.
+                self._error(502, f"clg-router: {exc}")
                 return
             retry = False
             retry_requires_wall_clock = False
@@ -682,7 +878,23 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._log_route("proxy", route_details, upstream.name, attempt)
                 conn.request(self.command, self.path, body=body or None, headers=headers)
                 response = conn.getresponse()
-                if response.status == 403:
+                if response.status == 429:
+                    # No capacity on this account right now. That is a fact about the
+                    # account, not about the request, so park it and try another one
+                    # instead of returning the rejection and killing the caller's work.
+                    buffered = response.read(RETRY_BODY_LIMIT + 1)
+                    cooldown = parse_retry_after(response.getheader("Retry-After"))
+                    if generation and len(buffered) <= RETRY_BODY_LIMIT:
+                        self.server.scheduler.rate_limited(upstream, cooldown)
+                        retry = True
+                        retry_requires_wall_clock = True
+                        retry_response = (response, buffered)
+                        prefer_not_name = upstream.name if pinned_upstream is None else None
+                    else:
+                        self._send_response(response, buffered)
+                        if generation:
+                            self.server.scheduler.rate_limited(upstream, cooldown)
+                elif response.status == 403:
                     content_length = response.getheader("Content-Length")
                     if content_length is not None and content_length.isdecimal() and int(content_length) > RETRY_BODY_LIMIT:
                         self._send_response(response)
@@ -848,8 +1060,22 @@ def router_healthy(
         return False
     if expected_upstreams is None:
         return True
-    actual = {(item.get("name"), item.get("port")) for item in status.get("upstreams", [])}
-    expected = {(str(item["name"]), int(item["port"])) for item in expected_upstreams}
+    actual = {
+        (
+            item.get("name"),
+            item.get("port"),
+            tuple(str(model) for model in (item.get("models") or ())),
+        )
+        for item in status.get("upstreams", [])
+    }
+    expected = {
+        (
+            str(item["name"]),
+            int(item["port"]),
+            tuple(str(model) for model in (item.get("models") or ())),
+        )
+        for item in expected_upstreams
+    }
     return actual == expected
 
 
@@ -928,25 +1154,35 @@ def start_router(
 # Proxy Codex (inchangé) + lanceur.
 # ---------------------------------------------------------------------------
 
-def proxy_healthy(port: int) -> bool:
+def proxy_healthy(port: int, models: tuple[str, ...] | list[str] | None = None) -> bool:
+    """Un compte est sain s'il sert ce qu'il declare, pas les trois tiers GPT.
+
+    Sans ce parametre, repointer un tier vers Grok ou DeepSeek rendait TOUS les comptes
+    GPT malsains d'un coup, parce que le controle exigeait le nouveau modele de tout le
+    monde. C'est ce qui empechait un fournisseur heterogene d'exister dans la flotte.
+    """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2) as r:
             catalog = r.read().decode()
     except Exception:
         return False
+    if models:
+        # Prefixes declares: il suffit qu'au moins un modele de la famille soit annonce.
+        return any(prefix.rstrip("*") in catalog for prefix in models)
     return all(m in catalog for m in (f'"{SOL}"', f'"{TERRA}"', f'"{LUNA}"'))
 
 
 def start_proxy(name: str, acc: dict) -> bool:
     port = acc["port"]
-    if proxy_healthy(port):
+    models = acc.get("models") or None
+    if proxy_healthy(port, models):
         return True
     if acc.get("brew"):
         subprocess.run(
             ["brew", "services", "restart", BREW_FORMULA],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-    if not proxy_healthy(port) and os.access(PROXY_BIN, os.X_OK):
+    if not proxy_healthy(port, models) and os.access(PROXY_BIN, os.X_OK):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, CCP_CONFIG_DIR=acc["dir"])
         with open(STATE_DIR / f"clg-{name}.log", "a") as log:
@@ -955,7 +1191,7 @@ def start_proxy(name: str, acc: dict) -> bool:
                 stdout=log, stderr=log, env=env, start_new_session=True,
             )
     for _ in range(40):
-        if proxy_healthy(port):
+        if proxy_healthy(port, models):
             return True
         time.sleep(0.25)
     return False
@@ -983,7 +1219,7 @@ def print_status(reg: dict) -> None:
     else:
         print(f"@auto port {SHARED_ROUTER_PORT}  routeur partagé down (démarré à la demande)")
     for name, acc in sorted(reg.items()):
-        health = "proxy UP" if proxy_healthy(acc["port"]) else "proxy down (démarré à la demande)"
+        health = "proxy UP" if proxy_healthy(acc["port"], acc.get("models") or None) else "proxy down (démarré à la demande)"
         rport = acc["port"] + ROUTER_PORT_OFFSET
         status = router_status(rport)
         if status:
@@ -1070,7 +1306,14 @@ def main() -> None:
             + f"clg: vérifie aussi que le proxy sert bien {SOL}, {TERRA} et {LUNA} "
             + "(`clgctl config show`)."
         )
-    upstreams = [{"name": name, "port": acc["port"]} for name, acc in selected]
+    upstreams = [
+        {
+            "name": name,
+            "port": acc["port"],
+            "models": acc.get("models") or [],
+        }
+        for name, acc in selected
+    ]
     if not start_router("shared", SHARED_ROUTER_PORT, upstreams):
         sys.exit(
             f"clg: routeur partagé n'est pas sain sur le port {SHARED_ROUTER_PORT}.\n"
