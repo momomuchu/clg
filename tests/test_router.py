@@ -113,13 +113,25 @@ class RunningRouter:
         self.thread.join(timeout=2)
 
 
-def request(port: int, payload: dict[str, object], path: str = "/v1/messages", method: str = "POST") -> tuple[int, bytes]:
+def request(
+    port: int,
+    payload: dict[str, object],
+    path: str = "/v1/messages",
+    method: str = "POST",
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
     body = json.dumps(payload).encode()
+    request_headers = (
+        {"Content-Type": "application/json", "Content-Length": str(len(body))}
+        if method != "GET" else {}
+    )
+    if headers is not None:
+        request_headers.update(headers)
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     try:
         conn.request(
             method, path, body=body if method != "GET" else None,
-            headers={"Content-Type": "application/json", "Content-Length": str(len(body))} if method != "GET" else {},
+            headers=request_headers,
         )
         response = conn.getresponse()
         return response.status, response.read()
@@ -616,6 +628,60 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(anthropic_hits, 1)
                 self.assertEqual(proxy_hits, 1)
                 self.assertEqual(models, [clg.SOL])
+
+    def test_main_chat_anthropic_fallback_preserves_pinned_upstream(self) -> None:
+        class AnthropicStub(QuietHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        class ProxyAStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"served by a"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        class ProxyBStub(QuietHandler):
+            requests = 0
+
+            def do_POST(self) -> None:
+                type(self).requests += 1
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"served by b"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        original = clg.oauth_token
+        clg.oauth_token = lambda: "test-token"
+        try:
+            with StubServer(ProxyAStub) as proxy_a, StubServer(ProxyBStub) as proxy_b, StubServer(AnthropicStub) as anthropic, RunningRouter(
+                [
+                    {"name": "a", "port": proxy_a.port},
+                    {"name": "b", "port": proxy_b.port},
+                ],
+                anthropic_port=anthropic.port,
+            ) as router:
+                result = request(
+                    router.port,
+                    main_payload(),
+                    headers={clg.PINNED_UPSTREAM_HEADER: "b"},
+                )
+        finally:
+            clg.oauth_token = original
+
+        self.assertEqual(result, (200, b"served by b"))
+        self.assertEqual(ProxyBStub.requests, 1)
+        self.assertEqual(ProxyAStub.requests, 0)
 
     def test_main_chat_does_not_fall_back_on_auth_or_client_error(self) -> None:
         # A dead OAuth token and a malformed request must stay visible. Falling back would
@@ -1158,6 +1224,25 @@ class RouterTests(unittest.TestCase):
                 clg.router_healthy(
                     9999,
                     [{"name": "sol", "port": 18765, "models": [clg.SOL]}],
+                )
+            )
+        finally:
+            clg.router_status = original_router_status
+
+    def test_router_healthy_treats_equivalent_model_order_as_current(self) -> None:
+        original_router_status = clg.router_status
+        clg.router_status = lambda _port: {
+            "router": "ok",
+            "main": clg.MAIN_MODEL,
+            "delegate_port": None,
+            "pinned_upstream": None,
+            "upstreams": [{"name": "sol", "port": 18765, "models": ["grok", "gpt-"]}],
+        }
+        try:
+            self.assertTrue(
+                clg.router_healthy(
+                    9999,
+                    [{"name": "sol", "port": 18765, "models": ["gpt-", "grok"]}],
                 )
             )
         finally:

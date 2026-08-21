@@ -640,7 +640,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             headers["authorization"] = f"Bearer {token}"
             beta = headers.pop("anthropic-beta", None) or headers.pop("Anthropic-Beta", None)
             headers["anthropic-beta"] = f"{beta},{OAUTH_BETA}" if beta and OAUTH_BETA not in beta else (beta or OAUTH_BETA)
-            self._relay_anthropic(body, headers, route_details, token)
+            self._relay_anthropic(body, headers, route_details, token, pinned_upstream)
             return
         self._relay_proxy(body, headers, route_details, pinned_upstream)
 
@@ -678,6 +678,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         headers: dict[str, str],
         route_details: tuple[str, list[str]] | None,
         token: str,
+        pinned_upstream: str | None,
     ) -> None:
         conn = self.server.anthropic_connection_factory()
         self._log_route("anthropic", route_details, ANTHROPIC_HOST, 1)
@@ -686,7 +687,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             response = conn.getresponse()
         except Exception as exc:
             conn.close()
-            if self._fallback_to_proxy(body, route_details, f"injoignable: {exc}"):
+            if self._fallback_to_proxy(body, route_details, f"injoignable: {exc}", pinned_upstream):
                 return
             self._error(502, f"clg-router: upstream anthropic injoignable: {exc}")
             return
@@ -702,7 +703,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             conn.close()
-            if self._fallback_to_proxy(body, route_details, reason):
+            if self._fallback_to_proxy(body, route_details, reason, pinned_upstream):
                 return
             conn = None
         try:
@@ -716,6 +717,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         body: bytes,
         route_details: tuple[str, list[str]] | None,
         reason: str,
+        pinned_upstream: str | None,
     ) -> bool:
         """Rejoue une requête de chat principal sur le proxy quand Anthropic est indisponible.
 
@@ -738,7 +740,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             % ("anth->proxy", f"{original} -> {SOL}", reason, "proxy-pool")
         )
         details = (f"{original} -> {SOL} (fallback {reason})", route_details[1] if route_details else [])
-        self._relay_proxy(new_body, self._forward_headers("proxy", new_body), details, None)
+        self._relay_proxy(new_body, self._forward_headers("proxy", new_body), details, pinned_upstream)
         return True
 
     def _relay_delegate(self, body: bytes) -> None:
@@ -1064,7 +1066,7 @@ def router_healthy(
         (
             item.get("name"),
             item.get("port"),
-            tuple(str(model) for model in (item.get("models") or ())),
+            frozenset(str(model) for model in (item.get("models") or ())),
         )
         for item in status.get("upstreams", [])
     }
@@ -1072,7 +1074,7 @@ def router_healthy(
         (
             str(item["name"]),
             int(item["port"]),
-            tuple(str(model) for model in (item.get("models") or ())),
+            frozenset(str(model) for model in (item.get("models") or ())),
         )
         for item in expected_upstreams
     }
