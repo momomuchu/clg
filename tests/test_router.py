@@ -1800,6 +1800,43 @@ class RouterTests(unittest.TestCase):
         scheduler.release(fallback)
         scheduler.release(occupied_alternative)
 
+    def test_subagent_tier_never_carries_the_cli_context_suffix(self) -> None:
+        # `[1m]` is a Claude Code CLI form: it asks the local binary for the 1M window
+        # and the router strips it on the way in. It is not part of any upstream model
+        # name, and proxy_healthy() looks the tier up in the proxy catalogue verbatim,
+        # so a suffix that survives into the outgoing payload names a model nobody
+        # serves. Configuring the opus tier as `gpt-5.6-sol[1m]` must still put
+        # `gpt-5.6-sol` on the wire.
+        self.assertEqual(
+            clg.load_routing_tier("gpt-5.6-sol[1m]"), "gpt-5.6-sol",
+            "a configured tier must lose the CLI-only suffix before it names an upstream",
+        )
+        original = clg.SOL
+        clg.SOL = clg.load_routing_tier("gpt-5.6-sol[1m]")
+        try:
+            for model in ("claude-opus-5", "claude-opus-5[1m]", "opus", "claude-fable-5"):
+                with self.subTest(model=model):
+                    target, effective = clg.route_model(model, proxy_payload(model))
+                    self.assertEqual(target, "proxy")
+                    self.assertEqual(effective, "gpt-5.6-sol")
+        finally:
+            clg.SOL = original
+
+    def test_the_cli_context_suffix_is_a_launcher_form_not_a_wire_name(self) -> None:
+        # The two halves of the same setting, and they must stay asymmetric. Claude Code
+        # 2.1.251 gates the 1M window on `/\[1m\]/i` against the model NAME with no
+        # allowlist, so `gpt-5.6-sol[1m]` in ANTHROPIC_DEFAULT_OPUS_MODEL is what buys a
+        # subagent the 1M window. The same string on the wire names a model no upstream
+        # serves. So the launcher passes the configured tier through untouched and the
+        # router strips it.
+        configured = "gpt-5.6-sol[1m]"
+        self.assertEqual(clg.launcher_tier(configured), configured)
+        self.assertEqual(clg.load_routing_tier(configured), "gpt-5.6-sol")
+        self.assertNotEqual(clg.launcher_tier(configured), clg.load_routing_tier(configured))
+        # An unsuffixed tier is untouched by either side.
+        self.assertEqual(clg.launcher_tier("gpt-5.6-terra"), "gpt-5.6-terra")
+        self.assertEqual(clg.load_routing_tier("gpt-5.6-terra"), "gpt-5.6-terra")
+
     def test_pinned_compatibility_router_delegates_to_shared_scheduler(self) -> None:
         class A(QuietHandler):
             def do_POST(self) -> None: self.send_response(500); self.send_header("Content-Length", "0"); self.end_headers()

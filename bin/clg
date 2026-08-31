@@ -192,11 +192,35 @@ SUBAGENT_IDENTITY_PREFIXES = (
 )
 # Blocs de transport qui précèdent l'identité réelle et ne l'expriment pas.
 NON_IDENTITY_PREFIXES = ("x-anthropic-billing-header",)
-SOL = ROUTING["tiers"]["opus"]
-TERRA = ROUTING["tiers"]["sonnet"]
-LUNA = ROUTING["tiers"]["haiku"]
+# `[1m]` is a Claude Code CLI form asking the local binary for the 1M window; no upstream
+# knows it. route_model() strips it from the INCOMING model, but a tier is also written
+# straight into the outgoing payload (opus/fable routing and the Anthropic->proxy
+# fallback) and looked up verbatim in the proxy catalogue by proxy_healthy(). Strip it
+# once here, at the one place a tier enters the process, so configuring the opus tier as
+# `gpt-5.6-sol[1m]` selects the 1M-capable CLI form without ever naming a model the proxy
+# does not serve.
+def load_routing_tier(model: str) -> str:
+    """The wire name of a configured tier."""
+    return model.removesuffix("[1m]")
+
+
+def launcher_tier(model: str) -> str:
+    """The name handed to Claude Code for a tier.
+
+    Deliberately the identity function, and the asymmetry with load_routing_tier() is
+    the point. Claude Code 2.1.251 decides the 1M window with `/\\[1m\\]/i` against the
+    model name and no allowlist, so `gpt-5.6-sol[1m]` in ANTHROPIC_DEFAULT_OPUS_MODEL is
+    what actually buys a subagent the 1M window. Stripping it here would silently drop
+    the window back to the default.
+    """
+    return model
+
+
+SOL = load_routing_tier(ROUTING["tiers"]["opus"])
+TERRA = load_routing_tier(ROUTING["tiers"]["sonnet"])
+LUNA = load_routing_tier(ROUTING["tiers"]["haiku"])
 RETIRED_MODEL_ALIASES = {"grok-4.5": LUNA}
-INHERITED = ROUTING["tiers"]["inherited"]
+INHERITED = load_routing_tier(ROUTING["tiers"]["inherited"])
 AGENT_ROUTING = ROUTING.get("agents") or {}
 ANTHROPIC_HOST = "api.anthropic.com"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -1347,7 +1371,9 @@ def main() -> None:
     # les alias (`opus`, `fable`…) avec les tiers de base.
     routing = load_routing(None if shared else selector)
     main_model_env = routing["main_model_env"]
-    sol, terra, luna = (routing["tiers"][tier] for tier in ("opus", "sonnet", "haiku"))
+    sol, terra, luna = (
+        launcher_tier(routing["tiers"][tier]) for tier in ("opus", "sonnet", "haiku")
+    )
 
     env = os.environ.copy()
     # Tiers explicites : le chat reste sur un vrai Opus Anthropic (compaction et
