@@ -22,6 +22,13 @@ Usage:
   clg @auto [args claude...]        équivalent au routeur partagé par défaut
   clg @list                         état des comptes + proxies
   CLG_ACCOUNT=b clg ...             équivalent à clg @b
+  clgl [args claude...]             même routage, config LOCALE seulement
+  CLG_LOCAL_ONLY=1 clg ...          équivalent à clgl
+
+Le mode local (`clgl`) retire la source de settings `user` : le CLAUDE.md, les
+rules, skills, agents, hooks et serveurs MCP de ~/.claude restent hors session.
+Seuls le CLAUDE.md et le .claude/ du projet courant chargent. Le routage des
+modèles est identique : il vient de l'environnement, pas des settings.
 
 Comptes gérés par `clg-account add <nom>` : une instance de proxy par compte,
 chacune sur son propre port (CCP_CONFIG_DIR isole l'auth). Chaque compte a son
@@ -1280,6 +1287,35 @@ def resolve_claude_bin() -> str:
     sys.exit("clg: Claude Code est introuvable. Définissez CLG_CLAUDE_BIN_OVERRIDE si nécessaire.")
 
 
+# Le seul réglage utilisateur que le mode local rend : `clg` passe toujours
+# --dangerously-skip-permissions, dont le dialogue de confirmation n'est éteint
+# que par cette clé des settings utilisateur. --settings n'est pas filtré par
+# --setting-sources, donc il la rend sans rouvrir le reste du global.
+LOCAL_ONLY_SETTINGS = json.dumps(
+    {"skipDangerousModePermissionPrompt": True}, separators=(",", ":")
+)
+
+
+def launch_flags(args: list, local_only: bool) -> list:
+    """Drapeaux que clg place avant ceux de l'utilisateur.
+
+    `local_only` (le lanceur `clgl`) retire la source de settings `user` : le
+    CLAUDE.md, les rules, skills, agents, hooks et serveurs MCP de ~/.claude
+    restent hors session, seuls le CLAUDE.md et le .claude/ du projet chargent.
+    Les drapeaux explicites de l'utilisateur passent après et gagnent donc sur
+    ceux-ci, y compris un --setting-sources qu'il fournirait lui-même.
+    """
+    flags = ["--teammate-mode", "in-process", "--dangerously-skip-permissions"]
+    if not any(a in ("-p", "--print") for a in args):
+        flags = ["--remote-control", *flags]
+    if local_only:
+        flags += [
+            "--setting-sources", "project,local",
+            "--settings", LOCAL_ONLY_SETTINGS,
+        ]
+    return flags
+
+
 def main() -> None:
     args = sys.argv[1:]
 
@@ -1398,17 +1434,24 @@ def main() -> None:
         CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1",
     )
 
+    local_only = os.environ.get("CLG_LOCAL_ONLY", "") not in ("", "0")
+
     print(
         f"clg: chat={main_model_env} (Anthropic réel, contexte 1M) · routeur={'partagé' if shared else '@' + selector} · sub-agents GPT: opus/fable→{sol}, sans modèle/sonnet→{terra}, haiku→{luna}",
         file=sys.stderr,
     )
+    if local_only:
+        print(
+            "clg: config LOCALE seulement — ~/.claude (CLAUDE.md, rules, skills, "
+            "agents, hooks, MCP) hors session ; seuls le CLAUDE.md et le .claude/ "
+            "du projet chargent.",
+            file=sys.stderr,
+        )
 
     # Keep teammates in this process so they inherit the proxy authentication and
     # tier mappings exactly. Print mode is headless: Remote Control's first-party
     # WebSocket is both unnecessary and incompatible with the proxy auth token.
-    launch = ["--teammate-mode", "in-process", "--dangerously-skip-permissions"]
-    if not any(a in ("-p", "--print") for a in args):
-        launch = ["--remote-control", *launch]
+    launch = launch_flags(args, local_only)
 
     claude = resolve_claude_bin()
     os.execve(claude, [claude, *launch, *args], env)

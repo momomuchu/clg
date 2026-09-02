@@ -1,0 +1,14 @@
+#!/bin/sh
+# clgl — clg sans la config globale de Claude Code.
+#
+# Routage identique à clg (chat Opus Anthropic réel, sub-agents sur le proxy
+# GPT) : il vient de l'environnement, pas des settings, donc le mode local ne
+# le change pas. Ce que clgl retire, c'est la source de settings `user` —
+# ~/.claude/CLAUDE.md, rules, skills, agents, hooks et serveurs MCP. Seuls le
+# CLAUDE.md et le .claude/ du projet courant chargent.
+#
+# Tout est passé tel quel à clg, sigils compris : `clgl @b`, `clgl -p ...`.
+set -eu
+CLG_LOCAL_ONLY=1
+export CLG_LOCAL_ONLY
+exec "$(dirname "$0")/clg" "$@"

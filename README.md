@@ -64,9 +64,29 @@ clg                    # shared router across every authenticated account
 clg @auto              # same shared-router behavior explicitly
 clg @b                 # pin account "b" for debugging
 clg @list              # accounts + proxy + router + Anthropic OAuth status
+clgl                   # same routing, project config only (see below)
 clg-account add b      # add a ChatGPT Pro account (device-code login)
 clg-fleet -j 3 p1.txt p2.txt   # batch `clg -p` runs
 ```
+
+### `clgl` — project config only
+
+`clgl` is `clg` with the `user` setting source dropped, so `~/.claude` stays out of the
+session: no user `CLAUDE.md`, rules, skills, agents, hooks or MCP servers. Only the
+current project's `CLAUDE.md` and `.claude/` load. Model routing is unchanged — it comes
+from the environment, not from settings.
+
+```sh
+clgl                   # shared router, project config only
+clgl @b -p "..."       # sigils and flags pass through untouched
+CLG_LOCAL_ONLY=1 clg   # same thing without the wrapper
+```
+
+Because `clg` always passes `--dangerously-skip-permissions`, whose confirmation dialog
+is normally suppressed by a user setting, `clgl` hands that one key back through
+`--settings`, which `--setting-sources` does not gate. Everything else stays dropped: a
+global `effortLevel`, `env` block or `statusLine` will not apply. Your own
+`--setting-sources` is passed after ours and wins.
 
 Each account gets its own proxy instance (isolated `CCP_CONFIG_DIR`). The default shared
 router listens on port `28765`, starts every authenticated account proxy, and picks the
